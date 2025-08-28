@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/erofs/go-erofs/internal/compress"
 	"github.com/erofs/go-erofs/internal/disk"
 )
 
@@ -30,6 +31,9 @@ var (
 	// ErrNotImplemented is returned when a feature is known but not implemented
 	// yet by this library
 	ErrNotImplemented = errors.New("not implemented")
+
+	// ErrCompression is returned when there is an error during compression or decompression
+	ErrCompression = errors.New("compression error")
 )
 
 // Stat is the erofs specific stat data returned by Stat and FileInfo requests
@@ -200,7 +204,8 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 
 		addr = int64(rawAddr) << int64(img.sb.BlkSizeBits)
 	case disk.LayoutCompressedFull, disk.LayoutCompressedCompact:
-		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.inode, ErrNotImplemented)
+		// 使用压缩块加载逻辑
+		return img.loadCompressedBlock(fi, pos)
 	default:
 		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.inode, ErrInvalid)
 	}
@@ -647,4 +652,179 @@ func decodeSuperBlock(b [disk.SizeSuperBlock]byte, sb *disk.SuperBlock) error {
 		return fmt.Errorf("invalid super block: invalid magic number %x", sb.MagicNumber)
 	}
 	return nil
+}
+
+// loadCompressedBlock 加载压缩块数据
+func (img *image) loadCompressedBlock(fi *fileInfo, pos int64) (*block, error) {
+	// 1. 获取压缩块映射信息
+	blockInfo, err := img.mapCompressedBlocks(fi, pos)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 计算块大小和偏移
+	blockSize := int(1 << img.sb.BlkSizeBits)
+	bn := int(pos >> img.sb.BlkSizeBits)
+	nblocks := calculateBlocks(img.sb.BlkSizeBits, fi.size)
+
+	// 3. 确定块结束位置
+	blockEnd := blockSize
+	if bn == nblocks-1 {
+		blockEnd = int(fi.size - int64(bn)*int64(blockSize))
+	}
+
+	// 4. 获取块缓冲区
+	b := img.getBlock()
+
+	// 5. 读取并解压缩数据
+	err = img.readCompressedBlock(fi, blockInfo, b.buf[:blockEnd])
+	if err != nil {
+		img.putBlock(b)
+		return nil, fmt.Errorf("failed to decompress block for nid %d: %w", fi.inode, err)
+	}
+
+	// 6. 设置块信息
+	b.offset = 0
+	b.end = int32(blockEnd)
+
+	return b, nil
+}
+
+// mapCompressedBlocks 获取压缩数据块的映射信息
+func (img *image) mapCompressedBlocks(fi *fileInfo, la int64) (*compress.BlockInfo, error) {
+	// 根据不同的压缩布局获取压缩块信息
+	switch fi.inodeLayout {
+	case disk.LayoutCompressedFull:
+		return img.mapCompressedFullBlocks(fi, la)
+	case disk.LayoutCompressedCompact:
+		return img.mapCompressedCompactBlocks(fi, la)
+	default:
+		return nil, fmt.Errorf("unsupported compressed layout: %d", fi.inodeLayout)
+	}
+}
+
+// mapCompressedFullBlocks 获取完全压缩布局的块映射
+func (img *image) mapCompressedFullBlocks(fi *fileInfo, la int64) (*compress.BlockInfo, error) {
+	// 计算压缩块大小和索引
+	clusterSize := int64(1 << img.sb.BlkSizeBits)
+	clusterIndex := la / clusterSize
+
+	// 获取压缩块头信息的地址
+	headerAddr := int64(fi.inodeData) << img.sb.BlkSizeBits
+	headerAddr += clusterIndex * compress.HeaderSize
+
+	// 读取压缩块头
+	var headerBuf [compress.HeaderSize]byte
+	n, err := img.meta.ReadAt(headerBuf[:], headerAddr)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to read compressed header: %w", err)
+	}
+	if n != compress.HeaderSize {
+		return nil, fmt.Errorf("incomplete header read: got %d, want %d", n, compress.HeaderSize)
+	}
+
+	// 解析压缩块头
+	isCompressed, physicalLen, err := compress.ParseBlockHeader(headerBuf[:])
+	if err != nil {
+		return nil, err
+	}
+
+	// 获取物理块地址
+	physicalAddr := headerAddr + compress.HeaderSize
+
+	// 如果不是压缩块，使用默认块大小
+	if !isCompressed {
+		physicalLen = clusterSize
+	}
+
+	// 创建块信息
+	blockInfo := &compress.BlockInfo{
+		LogicalAddr:  la - (la % clusterSize),
+		LogicalLen:   clusterSize,
+		PhysicalAddr: physicalAddr,
+		PhysicalLen:  physicalLen,
+		Algorithm:    uint32(img.sb.ComprAlgs & 0xFF), // 使用超级块中的算法
+		BlockOffset:  la % clusterSize,
+	}
+
+	return blockInfo, nil
+}
+
+// mapCompressedCompactBlocks 获取紧凑压缩布局的块映射
+func (img *image) mapCompressedCompactBlocks(fi *fileInfo, la int64) (*compress.BlockInfo, error) {
+	// 紧凑压缩布局的块映射逻辑与完全压缩类似，但有一些差异
+	// 在紧凑布局中，压缩块头信息存储在不同的位置
+
+	// 计算压缩块大小和索引
+	clusterSize := int64(1 << img.sb.BlkSizeBits)
+	clusterIndex := la / clusterSize
+
+	// 获取压缩块头信息
+	// 在紧凑布局中，头信息通常存储在inode数据区域
+	if fi.cached == nil {
+		return nil, errors.New("inode block not cached")
+	}
+
+	buf := fi.cached.bytes()
+	dataOffset := fi.dataOffset() + clusterIndex*compress.HeaderSize
+
+	if int64(len(buf)) < dataOffset+compress.HeaderSize {
+		return nil, fmt.Errorf("invalid compressed data for nid %d", fi.inode)
+	}
+
+	// 解析压缩块头
+	isCompressed, physicalLen, err := compress.ParseBlockHeader(buf[dataOffset : dataOffset+compress.HeaderSize])
+	if err != nil {
+		return nil, err
+	}
+
+	// 获取物理块地址
+	blkAddr := int64(fi.inodeData) << img.sb.BlkSizeBits
+	blkAddr += clusterIndex * clusterSize
+
+	// 如果不是压缩块，使用默认块大小
+	if !isCompressed {
+		physicalLen = clusterSize
+	}
+
+	// 创建块信息
+	blockInfo := &compress.BlockInfo{
+		LogicalAddr:  la - (la % clusterSize),
+		LogicalLen:   clusterSize,
+		PhysicalAddr: blkAddr,
+		PhysicalLen:  physicalLen,
+		Algorithm:    uint32(img.sb.ComprAlgs & 0xFF), // 使用超级块中的算法
+		BlockOffset:  la % clusterSize,
+	}
+
+	return blockInfo, nil
+}
+
+// readCompressedBlock 读取单个压缩块
+func (img *image) readCompressedBlock(fi *fileInfo, blockInfo *compress.BlockInfo, buffer []byte) error {
+	// 分配压缩数据缓冲区
+	compressedData := make([]byte, blockInfo.PhysicalLen)
+
+	// 读取压缩数据
+	n, err := img.meta.ReadAt(compressedData, blockInfo.PhysicalAddr)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("failed to read compressed data: %w", err)
+	}
+	if int64(n) != blockInfo.PhysicalLen {
+		return fmt.Errorf("incomplete read: got %d, want %d", n, blockInfo.PhysicalLen)
+	}
+
+	// 设置解压缩请求
+	req := &compress.DecompressRequest{
+		In:              compressedData,
+		Out:             buffer,
+		DecodedSkip:     uint32(blockInfo.BlockOffset),
+		InputSize:       uint32(blockInfo.PhysicalLen),
+		DecodedLength:   uint32(blockInfo.LogicalLen),
+		Algorithm:       blockInfo.Algorithm,
+		PartialDecoding: blockInfo.BlockOffset > 0 || int64(len(buffer)) < blockInfo.LogicalLen,
+	}
+
+	// 执行解压缩
+	return compress.Decompress(req)
 }
