@@ -443,22 +443,6 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 			p = "/"
 		}
 
-		// Merge mode: process whiteout markers.
-		if fsys.copyMerge && p != "/" {
-			base := path.Base(p)
-			if strings.HasPrefix(base, whiteoutPrefix) {
-				if base == opaqueWhiteout {
-					// Opaque directory: remove all prior children of parent.
-					fsys.removeChildren(path.Dir(p))
-				} else {
-					// File whiteout: remove the named entry.
-					target := path.Join(path.Dir(p), base[len(whiteoutPrefix):])
-					fsys.remove(target)
-				}
-				return nil
-			}
-		}
-
 		// Extract extended metadata from Sys().
 		var be *builder.Entry
 		switch sys := info.Sys().(type) {
@@ -478,6 +462,24 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 				Rdev:    sys.Rdev,
 				Xattrs:  sys.Xattrs,
 				Ino:     uint64(sys.Ino),
+			}
+		}
+		if fsys.copyMerge && p != "/" {
+			base := path.Base(p)
+			if strings.HasPrefix(base, whiteoutPrefix) {
+				if base == opaqueWhiteout {
+					fsys.removeChildren(path.Dir(p))
+				} else {
+					fsys.remove(path.Join(path.Dir(p), base[len(whiteoutPrefix):]))
+				}
+				return nil
+			}
+			if info.Mode()&(fs.ModeDevice|fs.ModeCharDevice) == fs.ModeDevice|fs.ModeCharDevice && (be == nil || be.Rdev == 0) {
+				fsys.remove(p)
+				return nil
+			}
+			if opaque, ok := info.(OverlayOpaque); ok && opaque.OverlayOpaque() {
+				fsys.removeChildren(p)
 			}
 		}
 
