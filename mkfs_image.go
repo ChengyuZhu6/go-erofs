@@ -102,23 +102,6 @@ func (fsys *Writer) copyFromImage(img *image) error {
 		cur := queue[0]
 		queue = queue[1:]
 
-		// Merge mode: process whiteout markers.
-		if fsys.copyMerge && cur.path != "/" {
-			base := path.Base(cur.path)
-			if len(base) > len(whiteoutPrefix) && base[:len(whiteoutPrefix)] == whiteoutPrefix {
-				if base == opaqueWhiteout {
-					fsys.removeChildren(path.Dir(cur.path))
-				} else {
-					target := path.Dir(cur.path) + "/" + base[len(whiteoutPrefix):]
-					if path.Dir(cur.path) == "/" {
-						target = "/" + base[len(whiteoutPrefix):]
-					}
-					fsys.remove(target)
-				}
-				continue
-			}
-		}
-
 		inodeAddr := metaStart + int64(cur.nid*disk.SizeInodeCompact)
 		buf := at(inodeAddr)
 		if len(buf) < disk.SizeInodeCompact {
@@ -197,6 +180,24 @@ func (fsys *Writer) copyFromImage(img *image) error {
 
 		trailingAddr := inodeAddr + int64(icSize) + int64(xattrSize)
 		typ := mode & disk.StatTypeMask
+		if fsys.copyMerge && cur.path != "/" {
+			base := path.Base(cur.path)
+			if len(base) > len(whiteoutPrefix) && base[:len(whiteoutPrefix)] == whiteoutPrefix {
+				if base == opaqueWhiteout {
+					fsys.removeChildren(path.Dir(cur.path))
+				} else {
+					fsys.remove(path.Join(path.Dir(cur.path), base[len(whiteoutPrefix):]))
+				}
+				continue
+			}
+			if typ == disk.StatTypeChrdev && disk.RdevFromMode(mode, idata) == 0 {
+				fsys.remove(cur.path)
+				continue
+			}
+			if xattrs["trusted.overlay.opaque"] == "y" {
+				fsys.removeChildren(cur.path)
+			}
+		}
 
 		// Build fsEntry directly, bypassing builder.Entry + add() overhead.
 		fe := &fsEntry{

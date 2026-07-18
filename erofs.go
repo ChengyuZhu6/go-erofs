@@ -130,6 +130,13 @@ type DataRange struct {
 	Size   int64  // byte length of this entry
 }
 
+// OverlayOpaque may be implemented by a directory FileInfo returned from an
+// overlay upper source. When CopyFrom is used with Merge, an opaque directory
+// removes all children inherited from prior sources.
+type OverlayOpaque interface {
+	OverlayOpaque() bool
+}
+
 type options struct {
 	extraDevices []io.ReaderAt
 }
