@@ -232,9 +232,9 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 		}
 	}
 
-	// Error out filesystems with unsupported compressed inodes
-	if i.sb.FeatureIncompat&disk.FeatureIncompatLZ4_0Padding != 0 ||
-		i.sb.ComprAlgs != 0 {
+	// LZ4_0Padding is a format compatibility bit. It does not imply that this
+	// image contains compressed inodes; ComprAlgs does.
+	if i.sb.ComprAlgs != 0 {
 		return nil, fmt.Errorf("unsupported compressed filesystem (FeatureIncompat=0x%x, ComprAlgs=0x%x): %w",
 			i.sb.FeatureIncompat, i.sb.ComprAlgs, ErrNotImplemented)
 	}

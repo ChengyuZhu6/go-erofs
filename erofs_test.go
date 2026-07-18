@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -100,6 +101,61 @@ func TestErofs(t *testing.T) {
 			t.Fatalf("expected ErrNotImplemented, got %v", err)
 		}
 	})
+}
+
+func TestOpenTarIndexWithoutCompression(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mkfs.erofs tar-index mode is not included on Windows")
+	}
+	if _, err := erofstest.CheckMkfsVersion("1.0"); err != nil {
+		t.Skipf("skipping: %v", err)
+	}
+
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "data.tar")
+	tarFile, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tarStream := erofstest.TarFromWriterTo(erofstest.TarAll(
+		erofstest.TarContext{}.File("/file.txt", []byte("content\n"), 0644),
+	))
+	if _, err := io.Copy(tarFile, tarStream); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarStream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	imagePath := filepath.Join(dir, "meta.erofs")
+	if out, err := exec.Command("mkfs.erofs", "--tar=i", imagePath, tarPath).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs.erofs --tar=i: %v\n%s", err, out)
+	}
+	imageFile, err := os.Open(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = imageFile.Close() })
+	dataFile, err := os.Open(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dataFile.Close() })
+
+	image, err := erofs.Open(imageFile, erofs.WithExtraDevices(dataFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := fs.ReadFile(image, "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "content\n" {
+		t.Fatalf("file content=%q, want %q", data, "content\n")
+	}
 }
 
 func BenchmarkLookup(b *testing.B) {
