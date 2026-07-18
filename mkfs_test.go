@@ -1540,6 +1540,104 @@ func TestMergeWhiteoutDir(t *testing.T) {
 	erofstest.CheckNotExists(t, efs, "dir/file.txt")
 }
 
+func TestMergeOverlayWhiteout(t *testing.T) {
+	base := fstest.MapFS{
+		"keep.txt":   {Data: []byte("keep"), Mode: 0o644},
+		"remove.txt": {Data: []byte("gone"), Mode: 0o644},
+	}
+	overlay := fstest.MapFS{
+		"remove.txt": {Mode: fs.ModeDevice | fs.ModeCharDevice | 0o600},
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(base); err != nil {
+		t.Fatal("CopyFrom base:", err)
+	}
+	if err := w.CopyFrom(overlay, erofs.Merge()); err != nil {
+		t.Fatal("CopyFrom overlay:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	erofstest.CheckFile(t, efs, "keep.txt", "keep")
+	erofstest.CheckNotExists(t, efs, "remove.txt")
+}
+
+func TestMergeOverlayOpaqueDirectory(t *testing.T) {
+	base := fstest.MapFS{
+		"dir/old.txt": {Data: []byte("old"), Mode: 0o644},
+	}
+	overlay := opaqueMapFS{MapFS: fstest.MapFS{
+		"dir":         {Mode: fs.ModeDir | 0o755},
+		"dir/new.txt": {Data: []byte("new"), Mode: 0o644},
+	}}
+
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(base); err != nil {
+		t.Fatal("CopyFrom base:", err)
+	}
+	if err := w.CopyFrom(overlay, erofs.Merge()); err != nil {
+		t.Fatal("CopyFrom overlay:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	erofstest.CheckNotExists(t, efs, "dir/old.txt")
+	erofstest.CheckFile(t, efs, "dir/new.txt", "new")
+}
+
+type opaqueMapFS struct {
+	fstest.MapFS
+}
+
+func (fsys opaqueMapFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	entries, err := fsys.MapFS.ReadDir(name)
+	if err != nil {
+		return nil, err
+	}
+	if name != "." {
+		return entries, nil
+	}
+	for i, entry := range entries {
+		if entry.Name() == "dir" {
+			entries[i] = opaqueDirEntry{DirEntry: entry}
+		}
+	}
+	return entries, nil
+}
+
+type opaqueDirEntry struct {
+	fs.DirEntry
+}
+
+func (entry opaqueDirEntry) Info() (fs.FileInfo, error) {
+	info, err := entry.DirEntry.Info()
+	if err != nil {
+		return nil, err
+	}
+	return opaqueDirInfo{FileInfo: info}, nil
+}
+
+type opaqueDirInfo struct {
+	fs.FileInfo
+}
+
+func (opaqueDirInfo) OverlayOpaque() bool {
+	return true
+}
+
 // TestCreateFSUIDGID tests a variety of UID/GID values including boundary
 // values for compact (uint16) and extended (uint32) inodes.
 func TestCreateFSUIDGID(t *testing.T) {
