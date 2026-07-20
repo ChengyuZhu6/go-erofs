@@ -210,6 +210,9 @@ func (fsys *Writer) copyFromImage(img *image) error {
 			size:    size,
 			xattrs:  xattrs,
 		}
+		if typ == disk.StatTypeReg && nlink > 1 {
+			fe.hardlinkKey = fmt.Sprintf("erofs:%d", cur.nid)
+		}
 		if nlink > 0 {
 			fe.nlink = nlink
 			fe.nlinkSet = true

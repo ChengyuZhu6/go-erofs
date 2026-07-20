@@ -64,6 +64,31 @@ type CreateOpt func(*createOptions)
 // CopyOpt configures a CopyFrom operation.
 type CopyOpt func(*Writer)
 
+// SourceEntry is an explicit filesystem entry for CopyEntries.
+// Paths are rooted and use slash separators. DataRanges are used only with
+// MetadataOnly; otherwise Data supplies the regular-file contents. For a
+// hardlink group, only the lexicographically first path may provide Data or
+// DataRanges; the remaining paths are inode aliases.
+type SourceEntry struct {
+	Path        string
+	Mode        fs.FileMode
+	Size        int64
+	UID, GID    uint32
+	Mtime       time.Time
+	Xattrs      map[string]string
+	LinkTarget  string
+	Data        io.Reader
+	DataRanges  []DataRange
+	HardlinkKey string
+}
+
+// SourceEntries describes an explicit tree for CopyEntries.
+type SourceEntries struct {
+	Entries              []SourceEntry
+	BlockSize            uint32
+	ExternalDeviceBlocks []uint64
+}
+
 // --- Constructor ---
 
 // Create returns a Writer that produces an EROFS image on Close.
@@ -457,13 +482,14 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 		case *Stat:
 			// EROFS image source: convert *Stat to *builder.Entry.
 			be = &builder.Entry{
-				UID:     sys.UID,
-				GID:     sys.GID,
-				Mtime:   sys.Mtime,
-				MtimeNs: sys.MtimeNs,
-				Nlink:   uint32(sys.Nlink),
-				Rdev:    sys.Rdev,
-				Xattrs:  sys.Xattrs,
+				UID:         sys.UID,
+				GID:         sys.GID,
+				Mtime:       sys.Mtime,
+				MtimeNs:     sys.MtimeNs,
+				Nlink:       uint32(sys.Nlink),
+				Rdev:        sys.Rdev,
+				Xattrs:      sys.Xattrs,
+				HardlinkKey: erofsHardlinkKey(info, sys),
 			}
 		}
 		if fsys.copyMerge && p != "/" {
@@ -584,6 +610,134 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 		}
 		return fsys.add(p, info)
 	})
+}
+
+// CopyEntries adds explicit source entries without relying on fs.FileInfo.Sys.
+func (fsys *Writer) CopyEntries(src SourceEntries, opts ...CopyOpt) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
+	fsys.copyMetadataOnly = false
+	fsys.copyMerge = false
+	fsys.copyDeviceID = 0
+	fsys.copyDeviceCount = 0
+	for _, opt := range opts {
+		opt(fsys)
+	}
+	if src.BlockSize != 0 {
+		if err := fsys.setBlockSize(int(src.BlockSize)); err != nil {
+			return err
+		}
+	}
+	if fsys.copyMetadataOnly && len(src.ExternalDeviceBlocks) > 0 {
+		if len(src.ExternalDeviceBlocks) > int(^uint16(0)) {
+			return fmt.Errorf("metadata-only source declares too many external devices: %d", len(src.ExternalDeviceBlocks))
+		}
+		fsys.devices = append(fsys.devices, src.ExternalDeviceBlocks...)
+		fsys.copyDeviceID = uint16(len(fsys.devices) - len(src.ExternalDeviceBlocks) + 1)
+		fsys.copyDeviceCount = uint16(len(src.ExternalDeviceBlocks))
+	}
+	entries := append([]SourceEntry(nil), src.Entries...)
+	sort.Slice(entries, func(i, j int) bool { return cleanPath(entries[i].Path) < cleanPath(entries[j].Path) })
+	paths := make(map[string]struct{}, len(entries))
+	hardlinks := make(map[string]SourceEntry)
+	for _, entry := range entries {
+		p := cleanPath(entry.Path)
+		if _, ok := paths[p]; ok {
+			return fmt.Errorf("duplicate source entry %s", p)
+		}
+		paths[p] = struct{}{}
+		if entry.HardlinkKey != "" {
+			if previous, ok := hardlinks[entry.HardlinkKey]; ok {
+				if !sameHardlinkMetadata(previous, entry) {
+					return fmt.Errorf("hardlink key %q has conflicting metadata at %s and %s", entry.HardlinkKey, cleanPath(previous.Path), p)
+				}
+				if entry.Data != nil || len(entry.DataRanges) != 0 {
+					return fmt.Errorf("hardlink key %q has multiple content sources", entry.HardlinkKey)
+				}
+			} else if entry.Size > 0 && entry.Data == nil && len(entry.DataRanges) == 0 && !fsys.copyMetadataOnly {
+				return fmt.Errorf("hardlink key %q canonical entry %s has no data", entry.HardlinkKey, p)
+			}
+			hardlinks[entry.HardlinkKey] = entry
+		}
+		if err := fsys.copyEntry(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sameHardlinkMetadata(a, b SourceEntry) bool {
+	if goModeToUnixMode(a.Mode) != goModeToUnixMode(b.Mode) || a.Size != b.Size ||
+		a.UID != b.UID || a.GID != b.GID || !a.Mtime.Equal(b.Mtime) || a.LinkTarget != b.LinkTarget ||
+		len(a.Xattrs) != len(b.Xattrs) {
+		return false
+	}
+	for key, value := range a.Xattrs {
+		if b.Xattrs[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func (fsys *Writer) copyEntry(entry SourceEntry) error {
+	p := cleanPath(entry.Path)
+	if entry.Size < 0 {
+		return fmt.Errorf("source entry %s has negative size %d", p, entry.Size)
+	}
+	if !entry.Mtime.IsZero() && entry.Mtime.Unix() < 0 {
+		return fmt.Errorf("source entry %s has pre-epoch mtime", p)
+	}
+	mode := goModeToUnixMode(entry.Mode)
+	typ := mode & disk.StatTypeMask
+	if entry.HardlinkKey != "" && typ != disk.StatTypeReg {
+		return fmt.Errorf("source entry %s has hardlink key but is not a regular file", p)
+	}
+	if typ == disk.StatTypeReg && entry.Size > 0 && entry.Data == nil && len(entry.DataRanges) == 0 && entry.HardlinkKey == "" && !fsys.copyMetadataOnly {
+		return fmt.Errorf("source entry %s has no data", p)
+	}
+	be := &builder.Entry{
+		UID:        entry.UID,
+		GID:        entry.GID,
+		Xattrs:     cloneXattrs(entry.Xattrs),
+		LinkTarget: entry.LinkTarget,
+		Data:       entry.Data,
+	}
+	if !entry.Mtime.IsZero() {
+		be.Mtime = uint64(entry.Mtime.Unix())
+		be.MtimeNs = uint32(entry.Mtime.Nanosecond())
+	}
+	if len(entry.DataRanges) > 0 {
+		if !fsys.copyMetadataOnly {
+			return fmt.Errorf("source entry %s has data ranges outside metadata-only mode", p)
+		}
+		chunks, err := fsys.chunksFromRanges(entry.DataRanges, entry.Size)
+		if err != nil {
+			return fmt.Errorf("source entry %s: %w", p, err)
+		}
+		be.Chunks = chunks
+		be.Contiguous = len(entry.DataRanges) == 1 && entry.DataRanges[0].Offset != holeOffset
+	}
+	info := sourceFileInfo{name: path.Base(p), size: entry.Size, mode: entry.Mode, mtime: entry.Mtime, sys: be}
+	if err := fsys.add(p, info); err != nil {
+		return err
+	}
+	if p != "/" {
+		fsys.byPath[p].hardlinkKey = entry.HardlinkKey
+	}
+	return nil
+}
+
+func cloneXattrs(xattrs map[string]string) map[string]string {
+	if len(xattrs) == 0 {
+		return nil
+	}
+	copy := make(map[string]string, len(xattrs))
+	for key, value := range xattrs {
+		copy[key] = value
+	}
+	return copy
 }
 
 // --- Writer finalization ---
@@ -788,6 +942,7 @@ type fsEntry struct {
 
 	removed      bool // true if removed by a whiteout in a merge layer
 	metadataOnly bool // from a metadata-only CopyFrom; use chunk-based layout
+	hardlinkKey  string
 }
 
 // createOptions holds the parsed option values for Create.
@@ -868,7 +1023,8 @@ type erofsEntry struct {
 	data io.Reader
 
 	// Extended attributes
-	xattrs map[string]string
+	xattrs   map[string]string
+	hardlink *erofsEntry
 
 	// EROFS layout (assigned during planning)
 	nid           uint64
@@ -920,6 +1076,21 @@ func (fi *entryFileInfo) Mode() fs.FileMode  { return fi.info.Mode() }
 func (fi *entryFileInfo) ModTime() time.Time { return fi.info.ModTime() }
 func (fi *entryFileInfo) IsDir() bool        { return fi.info.IsDir() }
 func (fi *entryFileInfo) Sys() any           { return fi.sys }
+
+type sourceFileInfo struct {
+	name  string
+	size  int64
+	mode  fs.FileMode
+	mtime time.Time
+	sys   *builder.Entry
+}
+
+func (fi sourceFileInfo) Name() string       { return fi.name }
+func (fi sourceFileInfo) Size() int64        { return fi.size }
+func (fi sourceFileInfo) Mode() fs.FileMode  { return fi.mode }
+func (fi sourceFileInfo) ModTime() time.Time { return fi.mtime }
+func (fi sourceFileInfo) IsDir() bool        { return fi.mode.IsDir() }
+func (fi sourceFileInfo) Sys() any           { return fi.sys }
 
 // writerFileInfo implements fs.FileInfo for an fsEntry.
 type writerFileInfo struct {
@@ -1087,6 +1258,9 @@ func (fsys *Writer) add(p string, info fs.FileInfo) error {
 		chunks:     be.Chunks,
 		contiguous: be.Contiguous,
 	}
+	if typ == disk.StatTypeReg {
+		fe.hardlinkKey = be.HardlinkKey
+	}
 	if be.Nlink > 0 {
 		fe.nlink = be.Nlink
 		fe.nlinkSet = true
@@ -1248,6 +1422,46 @@ func (fsys *Writer) buildErofsTree() *erofsEntry {
 		er *erofsEntry
 	}
 
+	type hardlinkGroup struct {
+		entry *fsEntry
+		count uint32
+	}
+	groups := map[string]*hardlinkGroup{}
+	var collect func(*fsEntry)
+	collect = func(entry *fsEntry) {
+		if !entry.removed && entry.hardlinkKey != "" {
+			group := groups[entry.hardlinkKey]
+			if group == nil || entry.path < group.entry.path {
+				groups[entry.hardlinkKey] = &hardlinkGroup{entry: entry, count: 1}
+			} else {
+				group.count++
+			}
+		}
+		for _, child := range entry.children {
+			collect(child)
+		}
+	}
+	collect(fsys.root)
+	for _, group := range groups {
+		group.count = 0
+	}
+	var count func(*fsEntry)
+	count = func(entry *fsEntry) {
+		if !entry.removed && entry.hardlinkKey != "" {
+			groups[entry.hardlinkKey].count++
+		}
+		for _, child := range entry.children {
+			count(child)
+		}
+	}
+	count(fsys.root)
+	canonical := make(map[string]*erofsEntry, len(groups))
+	for key, group := range groups {
+		inode := fsys.fsToErofs(group.entry)
+		inode.nlink = group.count
+		canonical[key] = inode
+	}
+
 	rootEr := fsys.fsToErofs(fsys.root)
 	queue := []pair{{fsys.root, rootEr}}
 
@@ -1275,6 +1489,18 @@ func (fsys *Writer) buildErofsTree() *erofsEntry {
 				continue
 			}
 			ent := fsys.fsToErofs(c)
+			if c.hardlinkKey != "" {
+				inode := canonical[c.hardlinkKey]
+				if c != groups[c.hardlinkKey].entry {
+					alias := *inode
+					alias.name = path.Base(c.path)
+					alias.path = c.path
+					alias.hardlink = inode
+					ent = &alias
+				} else {
+					ent = inode
+				}
+			}
 			cur.er.children = append(cur.er.children, ent)
 			if c.mode&disk.StatTypeMask == disk.StatTypeDir {
 				queue = append(queue, pair{c, ent})

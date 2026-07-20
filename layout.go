@@ -14,6 +14,9 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	w.entries = nil
 	var walk func(e *erofsEntry)
 	walk = func(e *erofsEntry) {
+		if e.hardlink != nil {
+			return
+		}
 		w.entries = append(w.entries, e)
 		if e.mode&disk.StatTypeMask == disk.StatTypeDir {
 			sort.Slice(e.children, func(i, j int) bool {
@@ -133,6 +136,20 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	}
 
 	w.rootNid = root.nid
+	resolveHardlinkNIDs(root)
+}
+
+func resolveHardlinkNIDs(e *erofsEntry) {
+	for _, child := range e.children {
+		if child.hardlink != nil {
+			child.nid = child.hardlink.nid
+			child.erofsFileType = child.hardlink.erofsFileType
+			continue
+		}
+		if child.mode&disk.StatTypeMask == disk.StatTypeDir {
+			resolveHardlinkNIDs(child)
+		}
+	}
 }
 
 // calcTrailingSize returns the number of bytes following the 64-byte inode.
