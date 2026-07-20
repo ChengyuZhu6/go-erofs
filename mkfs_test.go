@@ -1947,9 +1947,12 @@ type dataRangerFS struct {
 	file *dataRangerFileInfo
 	// deviceBlocks is the declared size (in 4096-byte blocks) of the backing device.
 	deviceBlocks uint64
+	deviceTable  []uint64
 }
 
 func (f *dataRangerFS) DeviceBlocks() uint64 { return f.deviceBlocks }
+
+func (f *dataRangerFS) ExternalDeviceBlocks() []uint64 { return f.deviceTable }
 
 func (f *dataRangerFS) Open(name string) (fs.File, error) {
 	if name == "." {
@@ -2123,6 +2126,43 @@ func TestCopyFromDataRange(t *testing.T) {
 		}
 		if ranges[1].Device != 1 || ranges[1].Offset != blockSize*20 || ranges[1].Size != blockSize*3 {
 			t.Errorf("ranges[1] = %+v, want {Device:1 Offset:%d Size:%d}", ranges[1], blockSize*20, blockSize*3)
+		}
+	})
+
+	t.Run("ranges span declared devices", func(t *testing.T) {
+		src := &dataRangerFS{
+			deviceTable: []uint64{1024, 1024},
+			file: &dataRangerFileInfo{
+				name: "data.bin",
+				size: blockSize * 2,
+				ranges: []erofs.DataRange{
+					{Device: 0, Offset: blockSize * 3, Size: blockSize},
+					{Device: 1, Offset: blockSize * 7, Size: blockSize},
+				},
+			},
+		}
+
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		if err := w.CopyFrom(src, erofs.MetadataOnly()); err != nil {
+			t.Fatal("CopyFrom:", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal("Close:", err)
+		}
+
+		erofstest.FsckErofsBytes(t, buf.Bytes())
+		dstFS, err := erofs.Open(bytes.NewReader(buf.Bytes()),
+			erofs.WithExtraDevices(bytes.NewReader(make([]byte, 1024*blockSize)), bytes.NewReader(make([]byte, 1024*blockSize))))
+		if err != nil {
+			t.Fatal("Open:", err)
+		}
+		ranges := statDataRange(t, dstFS, "data.bin")
+		if len(ranges) != 2 {
+			t.Fatalf("DataRange() len = %d, want 2; ranges = %v", len(ranges), ranges)
+		}
+		if ranges[0].Device != 1 || ranges[1].Device != 2 {
+			t.Fatalf("devices=%d,%d, want 1,2", ranges[0].Device, ranges[1].Device)
 		}
 	})
 
