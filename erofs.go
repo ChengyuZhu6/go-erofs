@@ -125,9 +125,10 @@ const holeOffset int64 = -1
 // there is no such fallback: files without DataRange() (or pre-built chunks)
 // are stored as chunk-based inodes with no physical mappings (all holes).
 type DataRange struct {
-	Device uint16 // index in the source external-device table; ignored for holes
-	Offset int64  // byte offset in the device, or -1 for a hole entry
-	Size   int64  // byte length of this entry
+	Device   uint16 // index in the source external-device table; ignored for holes
+	Existing bool   // Device is an already registered 1-based EROFS device ID
+	Offset   int64  // byte offset in the device, or -1 for a hole entry
+	Size     int64  // byte length of this entry
 }
 
 // ExternalDeviceTable may be implemented by a metadata-only CopyFrom source

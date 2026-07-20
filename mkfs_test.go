@@ -2086,6 +2086,42 @@ func TestCopyFromDataRange(t *testing.T) {
 		}
 	})
 
+	t.Run("range reuses an existing device", func(t *testing.T) {
+		base := &dataRangerFS{
+			deviceBlocks: 1024,
+			file:         &dataRangerFileInfo{name: "base.bin", size: blockSize, ranges: []erofs.DataRange{{Offset: 0, Size: blockSize}}},
+		}
+		upper := &dataRangerFS{
+			deviceBlocks: 1024,
+			file: &dataRangerFileInfo{name: "data.bin", size: blockSize * 2, ranges: []erofs.DataRange{
+				{Device: 1, Existing: true, Offset: blockSize * 5, Size: blockSize},
+				{Device: 0, Offset: blockSize * 7, Size: blockSize},
+			}},
+		}
+
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		if err := w.CopyFrom(base, erofs.MetadataOnly()); err != nil {
+			t.Fatal("copy base:", err)
+		}
+		if err := w.CopyFrom(upper, erofs.MetadataOnly()); err != nil {
+			t.Fatal("copy upper:", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal("Close:", err)
+		}
+
+		dstFS, err := erofs.Open(bytes.NewReader(buf.Bytes()),
+			erofs.WithExtraDevices(bytes.NewReader(make([]byte, 1024*blockSize)), bytes.NewReader(make([]byte, 1024*blockSize))))
+		if err != nil {
+			t.Fatal("Open:", err)
+		}
+		ranges := statDataRange(t, dstFS, "data.bin")
+		if len(ranges) != 2 || ranges[0].Device != 1 || ranges[1].Device != 2 {
+			t.Fatalf("ranges=%v, want devices 1,2", ranges)
+		}
+	})
+
 	t.Run("no data written for metadata-only", func(t *testing.T) {
 		// CopyFrom(MetadataOnly) must not copy any file data into the image.
 		// Read() returns the marker so that if CopyFrom accidentally opens
