@@ -125,9 +125,17 @@ const holeOffset int64 = -1
 // there is no such fallback: files without DataRange() (or pre-built chunks)
 // are stored as chunk-based inodes with no physical mappings (all holes).
 type DataRange struct {
-	Device uint16 // device index (0 for the device assigned by CopyFrom); ignored for holes
+	Device uint16 // index in the source external-device table; ignored for holes
 	Offset int64  // byte offset in the device, or -1 for a hole entry
 	Size   int64  // byte length of this entry
+}
+
+// ExternalDeviceTable may be implemented by a metadata-only CopyFrom source
+// whose DataRange values reference more than one external device. Each entry
+// is the size, in filesystem blocks, of the device at the matching DataRange
+// Device index.
+type ExternalDeviceTable interface {
+	ExternalDeviceBlocks() []uint64
 }
 
 // OverlayOpaque may be implemented by a directory FileInfo returned from an

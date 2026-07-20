@@ -37,6 +37,7 @@ type Writer struct {
 	copyMetadataOnly bool   // metadata-only for current CopyFrom
 	copyMerge        bool   // merge mode: apply whiteouts
 	copyDeviceID     uint16 // device ID assigned to current MetadataOnly CopyFrom
+	copyDeviceCount  uint16 // external devices declared by current MetadataOnly CopyFrom
 
 	dataFile *os.File // external data file (nil = spool mode)
 	dataOff  int64    // current byte offset in data file
@@ -384,6 +385,7 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 	fsys.copyMetadataOnly = false
 	fsys.copyMerge = false
 	fsys.copyDeviceID = 0
+	fsys.copyDeviceCount = 0
 	for _, opt := range opts {
 		opt(fsys)
 	}
@@ -413,9 +415,18 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 		}
 	}
 	if fsys.copyMetadataOnly {
-		if db, ok := src.(deviceBlocker); ok {
+		if table, ok := src.(ExternalDeviceTable); ok && len(table.ExternalDeviceBlocks()) > 0 {
+			blocks := table.ExternalDeviceBlocks()
+			if len(blocks) > int(^uint16(0)) {
+				return fmt.Errorf("metadata-only source declares too many external devices: %d", len(blocks))
+			}
+			fsys.devices = append(fsys.devices, blocks...)
+			fsys.copyDeviceID = uint16(len(fsys.devices) - len(blocks) + 1)
+			fsys.copyDeviceCount = uint16(len(blocks))
+		} else if db, ok := src.(deviceBlocker); ok {
 			fsys.devices = append(fsys.devices, db.DeviceBlocks())
 			fsys.copyDeviceID = uint16(len(fsys.devices))
+			fsys.copyDeviceCount = 1
 		}
 	}
 	if bt, ok := src.(buildTimer); ok && !fsys.hasBuildTime {
@@ -1426,11 +1437,8 @@ func (fsys *Writer) chunksFromRanges(ranges []DataRange, fileSize int64) ([]buil
 		if uint64(r.Offset)%blockSize != 0 {
 			return nil, fmt.Errorf("DataRange[%d]: Offset %d is not block-aligned (block size %d)", i, r.Offset, blockSize)
 		}
-		// Non-EROFS sources register exactly one device via DeviceBlocks();
-		// only Device=0 is valid. Device=0xFFFF would also wrap deviceID to 0
-		// (the primary image), producing an invalid mapping.
-		if r.Device != 0 {
-			return nil, fmt.Errorf("DataRange[%d]: Device %d out of range (source declared one device, only Device=0 is valid)", i, r.Device)
+		if r.Device >= fsys.copyDeviceCount {
+			return nil, fmt.Errorf("DataRange[%d]: Device %d out of range for %d declared external devices", i, r.Device, fsys.copyDeviceCount)
 		}
 		deviceID := r.Device + 1
 		startBlock := uint64(r.Offset) / blockSize
