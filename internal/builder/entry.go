@@ -17,6 +17,7 @@ type Entry struct {
 	Chunks       []Chunk   // physical block refs (metadata-only mode)
 	Contiguous   bool      // data blocks are contiguous; flat-plain is sufficient
 	MetadataOnly bool      // chunk-based layout even without chunks
+	HardlinkKey  string    // entries with the same key share one regular-file inode
 }
 
 // NullPhysicalBlock is the sentinel value for Chunk.PhysicalBlock that marks
