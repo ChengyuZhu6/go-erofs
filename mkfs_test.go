@@ -3,6 +3,7 @@ package erofs_test
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -348,6 +349,39 @@ func TestCopyEntriesMetadataOnlyDataRange(t *testing.T) {
 		t.Fatal("Open:", err)
 	}
 	erofstest.CheckFileBytes(t, efs, "range.bin", data)
+}
+
+func TestCopyEntriesAppliesTreePatch(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(fstest.MapFS{
+		"deleted":    &fstest.MapFile{Data: []byte("old")},
+		"dir/old":    &fstest.MapFile{Data: []byte("old")},
+		"dir/keepme": &fstest.MapFile{Data: []byte("old")},
+	}); err != nil {
+		t.Fatal("CopyFrom:", err)
+	}
+	if err := w.CopyEntries(erofs.SourceEntries{
+		RemovePaths: []string{"/deleted"},
+		OpaquePaths: []string{"/dir"},
+		Entries:     []erofs.SourceEntry{{Path: "/dir/new", Mode: 0o644, Size: 3, Data: bytes.NewReader([]byte("new"))}},
+	}, erofs.Merge()); err != nil {
+		t.Fatal("CopyEntries:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	if _, err := fs.Stat(efs, "deleted"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("deleted stat error=%v, want not exist", err)
+	}
+	if _, err := fs.Stat(efs, "dir/old"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("opaque child stat error=%v, want not exist", err)
+	}
+	erofstest.CheckFile(t, efs, "dir/new", "new")
 }
 
 // TestCreateFSMknod verifies char and block device creation.
