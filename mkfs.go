@@ -65,6 +65,33 @@ type CreateOpt func(*createOptions)
 // CopyOpt configures a CopyFrom operation.
 type CopyOpt func(*Writer)
 
+// SourceEntry is an explicit filesystem entry for CopyEntries.
+// Paths are rooted and use slash separators. DataRanges are used only with
+// MetadataOnly; otherwise Data supplies the regular-file contents. For a
+// hardlink group, only the lexicographically first path may provide Data or
+// DataRanges; the remaining paths are inode aliases.
+type SourceEntry struct {
+	Path        string
+	Mode        fs.FileMode
+	Size        int64
+	UID, GID    uint32
+	Mtime       time.Time
+	Xattrs      map[string]string
+	LinkTarget  string
+	Data        io.Reader
+	DataRanges  []DataRange
+	HardlinkKey string
+}
+
+// SourceEntries describes an explicit tree for CopyEntries.
+type SourceEntries struct {
+	Entries              []SourceEntry
+	BlockSize            uint32
+	ExternalDeviceBlocks []uint64
+	RemovePaths          []string
+	OpaquePaths          []string
+}
+
 // --- Constructor ---
 
 // Create returns a Writer that produces an EROFS image on Close.
@@ -595,6 +622,163 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 	})
 }
 
+// CopyEntries adds explicit source entries without relying on fs.FileInfo.Sys.
+func (fsys *Writer) CopyEntries(src SourceEntries, opts ...CopyOpt) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
+	fsys.copyMetadataOnly = false
+	fsys.copyMerge = false
+	fsys.copyDeviceID = 0
+	fsys.copyDeviceCount = 0
+	for _, opt := range opts {
+		opt(fsys)
+	}
+	if src.BlockSize != 0 {
+		if err := fsys.setBlockSize(int(src.BlockSize)); err != nil {
+			return err
+		}
+	}
+	if fsys.copyMetadataOnly && len(src.ExternalDeviceBlocks) > 0 {
+		if len(src.ExternalDeviceBlocks) > int(^uint16(0)) {
+			return fmt.Errorf("metadata-only source declares too many external devices: %d", len(src.ExternalDeviceBlocks))
+		}
+		fsys.devices = append(fsys.devices, src.ExternalDeviceBlocks...)
+		fsys.copyDeviceID = uint16(len(fsys.devices) - len(src.ExternalDeviceBlocks) + 1)
+		fsys.copyDeviceCount = uint16(len(src.ExternalDeviceBlocks))
+	}
+	for _, p := range src.RemovePaths {
+		fsys.remove(p)
+	}
+	for _, p := range src.OpaquePaths {
+		fsys.removeChildren(p)
+	}
+	entries := append([]SourceEntry(nil), src.Entries...)
+	sort.Slice(entries, func(i, j int) bool { return cleanPath(entries[i].Path) < cleanPath(entries[j].Path) })
+
+	// HardlinkKey is mapped onto the (Dev, Ino) identity that add() uses for
+	// hard-link detection: each distinct key gets a synthetic inode number on
+	// device 0, and every member of the group reports the group size as nlink.
+	links := make(map[string]*sourceHardlink)
+	for _, entry := range entries {
+		if entry.HardlinkKey == "" {
+			continue
+		}
+		link := links[entry.HardlinkKey]
+		if link == nil {
+			links[entry.HardlinkKey] = &sourceHardlink{ino: uint64(len(links)) + 1, nlink: 1}
+			continue
+		}
+		link.nlink++
+	}
+
+	paths := make(map[string]struct{}, len(entries))
+	seen := make(map[string]SourceEntry)
+	hardlinks := make(map[hardlinkKey]*fsInode)
+	for _, entry := range entries {
+		p := cleanPath(entry.Path)
+		if _, ok := paths[p]; ok {
+			return fmt.Errorf("duplicate source entry %s", p)
+		}
+		paths[p] = struct{}{}
+		if entry.HardlinkKey != "" {
+			if previous, ok := seen[entry.HardlinkKey]; ok {
+				if !sameHardlinkMetadata(previous, entry) {
+					return fmt.Errorf("hardlink key %q has conflicting metadata at %s and %s", entry.HardlinkKey, cleanPath(previous.Path), p)
+				}
+				if entry.Data != nil || len(entry.DataRanges) != 0 {
+					return fmt.Errorf("hardlink key %q has multiple content sources", entry.HardlinkKey)
+				}
+			} else if entry.Size > 0 && entry.Data == nil && len(entry.DataRanges) == 0 && !fsys.copyMetadataOnly {
+				return fmt.Errorf("hardlink key %q canonical entry %s has no data", entry.HardlinkKey, p)
+			}
+			seen[entry.HardlinkKey] = entry
+		}
+		if err := fsys.copyEntry(entry, links[entry.HardlinkKey], hardlinks); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sourceHardlink is the synthetic source-inode identity assigned to one
+// SourceEntry.HardlinkKey group.
+type sourceHardlink struct {
+	ino   uint64
+	nlink uint32
+}
+
+func sameHardlinkMetadata(a, b SourceEntry) bool {
+	if goModeToUnixMode(a.Mode) != goModeToUnixMode(b.Mode) || a.Size != b.Size ||
+		a.UID != b.UID || a.GID != b.GID || !a.Mtime.Equal(b.Mtime) || a.LinkTarget != b.LinkTarget ||
+		len(a.Xattrs) != len(b.Xattrs) {
+		return false
+	}
+	for key, value := range a.Xattrs {
+		if b.Xattrs[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func (fsys *Writer) copyEntry(entry SourceEntry, link *sourceHardlink, hardlinks map[hardlinkKey]*fsInode) error {
+	p := cleanPath(entry.Path)
+	if entry.Size < 0 {
+		return fmt.Errorf("source entry %s has negative size %d", p, entry.Size)
+	}
+	if !entry.Mtime.IsZero() && entry.Mtime.Unix() < 0 {
+		return fmt.Errorf("source entry %s has pre-epoch mtime", p)
+	}
+	mode := goModeToUnixMode(entry.Mode)
+	typ := mode & disk.StatTypeMask
+	if entry.HardlinkKey != "" && typ != disk.StatTypeReg {
+		return fmt.Errorf("source entry %s has hardlink key but is not a regular file", p)
+	}
+	if typ == disk.StatTypeReg && entry.Size > 0 && entry.Data == nil && len(entry.DataRanges) == 0 && entry.HardlinkKey == "" && !fsys.copyMetadataOnly {
+		return fmt.Errorf("source entry %s has no data", p)
+	}
+	be := &builder.Entry{
+		UID:        entry.UID,
+		GID:        entry.GID,
+		Xattrs:     cloneXattrs(entry.Xattrs),
+		LinkTarget: entry.LinkTarget,
+		Data:       entry.Data,
+	}
+	if !entry.Mtime.IsZero() {
+		be.Mtime = uint64(entry.Mtime.Unix())
+		be.MtimeNs = uint32(entry.Mtime.Nanosecond())
+	}
+	if link != nil {
+		be.Ino = link.ino
+		be.Nlink = link.nlink
+	}
+	if len(entry.DataRanges) > 0 {
+		if !fsys.copyMetadataOnly {
+			return fmt.Errorf("source entry %s has data ranges outside metadata-only mode", p)
+		}
+		chunks, err := fsys.chunksFromRanges(entry.DataRanges, entry.Size)
+		if err != nil {
+			return fmt.Errorf("source entry %s: %w", p, err)
+		}
+		be.Chunks = chunks
+		be.Contiguous = len(entry.DataRanges) == 1 && entry.DataRanges[0].Offset != holeOffset
+	}
+	info := sourceFileInfo{name: path.Base(p), size: entry.Size, mode: entry.Mode, mtime: entry.Mtime, sys: be}
+	return fsys.add(p, info, hardlinks)
+}
+
+func cloneXattrs(xattrs map[string]string) map[string]string {
+	if len(xattrs) == 0 {
+		return nil
+	}
+	copy := make(map[string]string, len(xattrs))
+	for key, value := range xattrs {
+		copy[key] = value
+	}
+	return copy
+}
+
 // --- Writer finalization ---
 
 // Close writes the EROFS image. The FS must not be used after Close.
@@ -1115,6 +1299,21 @@ type WriterStat struct {
 	Nlink   uint32
 	Xattrs  map[string]string
 }
+
+type sourceFileInfo struct {
+	name  string
+	size  int64
+	mode  fs.FileMode
+	mtime time.Time
+	sys   *builder.Entry
+}
+
+func (fi sourceFileInfo) Name() string       { return fi.name }
+func (fi sourceFileInfo) Size() int64        { return fi.size }
+func (fi sourceFileInfo) Mode() fs.FileMode  { return fi.mode }
+func (fi sourceFileInfo) ModTime() time.Time { return fi.mtime }
+func (fi sourceFileInfo) IsDir() bool        { return fi.mode.IsDir() }
+func (fi sourceFileInfo) Sys() any           { return fi.sys }
 
 // writerFileInfo implements fs.FileInfo for an fsEntry.
 type writerFileInfo struct {

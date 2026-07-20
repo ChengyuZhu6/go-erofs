@@ -217,6 +217,174 @@ func TestCreateFSMetadata(t *testing.T) {
 	}
 }
 
+func TestCopyEntriesPreservesHardlinkIdentity(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithBuildTime(1700000000, 0))
+	mtime := time.Unix(1700000001, 123456789)
+	err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+		{
+			Path:        "/a",
+			Mode:        0o640,
+			Size:        int64(len("shared content")),
+			UID:         1000,
+			GID:         2000,
+			Mtime:       mtime,
+			Xattrs:      map[string]string{"user.workspace": "checkpoint"},
+			Data:        bytes.NewReader([]byte("shared content")),
+			HardlinkKey: "workspace:1",
+		},
+		{
+			Path:        "/b",
+			Mode:        0o640,
+			Size:        int64(len("shared content")),
+			UID:         1000,
+			GID:         2000,
+			Mtime:       mtime,
+			Xattrs:      map[string]string{"user.workspace": "checkpoint"},
+			HardlinkKey: "workspace:1",
+		},
+	}})
+	if err != nil {
+		t.Fatal("CopyEntries:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	a := erofstest.Stat(t, efs, "a")
+	b := erofstest.Stat(t, efs, "b")
+	if a.Ino != b.Ino {
+		t.Fatalf("hardlink inode mismatch: a=%d b=%d", a.Ino, b.Ino)
+	}
+	if a.Nlink != 2 {
+		t.Fatalf("hardlink nlink=%d, want 2", a.Nlink)
+	}
+	erofstest.CheckFile(t, efs, "a", "shared content")
+	erofstest.CheckFile(t, efs, "b", "shared content")
+	erofstest.CheckXattrs(t, efs, "a", map[string]string{"user.workspace": "checkpoint"})
+}
+
+func TestCopyEntriesRejectsHardlinkMetadataConflict(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+		{Path: "/a", Mode: 0o644, Size: 1, Data: bytes.NewReader([]byte("a")), HardlinkKey: "inode"},
+		{Path: "/b", Mode: 0o600, Size: 1, Data: bytes.NewReader([]byte("a")), HardlinkKey: "inode"},
+	}})
+	if err == nil {
+		t.Fatal("CopyEntries accepted conflicting hardlink metadata")
+	}
+}
+
+func TestCopyEntriesRejectsMultipleHardlinkContentSources(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+		{Path: "/a", Mode: 0o644, Size: 1, Data: bytes.NewReader([]byte("a")), HardlinkKey: "inode"},
+		{Path: "/b", Mode: 0o644, Size: 1, Data: bytes.NewReader([]byte("a")), HardlinkKey: "inode"},
+	}})
+	if err == nil {
+		t.Fatal("CopyEntries accepted multiple hardlink content sources")
+	}
+}
+
+func TestCopyFromPreservesHardlinkIdentity(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("shared content"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, "a"), filepath.Join(root, "b")); err != nil {
+		t.Fatal(err)
+	}
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(os.DirFS(root)); err != nil {
+		t.Fatal("CopyFrom:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	a := erofstest.Stat(t, efs, "a")
+	b := erofstest.Stat(t, efs, "b")
+	if a.Ino != b.Ino || a.Nlink != 2 || b.Nlink != 2 {
+		t.Fatalf("hardlink mismatch: a=(ino=%d,nlink=%d) b=(ino=%d,nlink=%d)", a.Ino, a.Nlink, b.Ino, b.Nlink)
+	}
+}
+
+func TestCopyEntriesMetadataOnlyDataRange(t *testing.T) {
+	data := bytes.Repeat([]byte("range"), 819)
+	data = append(data, 0)
+	if len(data) != 4096 {
+		t.Fatalf("fixture size = %d, want 4096", len(data))
+	}
+	var meta testBuffer
+	w := erofs.Create(&meta)
+	err := w.CopyEntries(erofs.SourceEntries{
+		BlockSize:            4096,
+		ExternalDeviceBlocks: []uint64{1},
+		Entries: []erofs.SourceEntry{{
+			Path:       "/range.bin",
+			Mode:       0o644,
+			Size:       int64(len(data)),
+			DataRanges: []erofs.DataRange{{Device: 0, Offset: 0, Size: int64(len(data))}},
+		}},
+	}, erofs.MetadataOnly())
+	if err != nil {
+		t.Fatal("CopyEntries:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(meta.Bytes()), erofs.WithExtraDevices(bytes.NewReader(data)))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	erofstest.CheckFileBytes(t, efs, "range.bin", data)
+}
+
+func TestCopyEntriesAppliesTreePatch(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(fstest.MapFS{
+		"deleted":    &fstest.MapFile{Data: []byte("old")},
+		"dir/old":    &fstest.MapFile{Data: []byte("old")},
+		"dir/keepme": &fstest.MapFile{Data: []byte("old")},
+	}); err != nil {
+		t.Fatal("CopyFrom:", err)
+	}
+	if err := w.CopyEntries(erofs.SourceEntries{
+		RemovePaths: []string{"/deleted"},
+		OpaquePaths: []string{"/dir"},
+		Entries:     []erofs.SourceEntry{{Path: "/dir/new", Mode: 0o644, Size: 3, Data: bytes.NewReader([]byte("new"))}},
+	}, erofs.Merge()); err != nil {
+		t.Fatal("CopyEntries:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	if _, err := fs.Stat(efs, "deleted"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("deleted stat error=%v, want not exist", err)
+	}
+	if _, err := fs.Stat(efs, "dir/old"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("opaque child stat error=%v, want not exist", err)
+	}
+	erofstest.CheckFile(t, efs, "dir/new", "new")
+}
+
 // TestCreateFSMknod verifies char and block device creation.
 func TestCreateFSMknod(t *testing.T) {
 	var buf testBuffer
