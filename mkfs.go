@@ -1116,7 +1116,9 @@ func (fsys *Writer) add(p string, info fs.FileInfo) error {
 		if fsys.copyDeviceID > 0 {
 			offset := fsys.copyDeviceID - 1
 			for i := range fe.chunks {
-				fe.chunks[i].DeviceID += offset
+				if !fe.chunks[i].AbsoluteDeviceID {
+					fe.chunks[i].DeviceID += offset
+				}
 			}
 		}
 	}
@@ -1437,10 +1439,17 @@ func (fsys *Writer) chunksFromRanges(ranges []DataRange, fileSize int64) ([]buil
 		if uint64(r.Offset)%blockSize != 0 {
 			return nil, fmt.Errorf("DataRange[%d]: Offset %d is not block-aligned (block size %d)", i, r.Offset, blockSize)
 		}
-		if r.Device >= fsys.copyDeviceCount {
+		if r.Existing {
+			if r.Device == 0 || int(r.Device) > len(fsys.devices) {
+				return nil, fmt.Errorf("DataRange[%d]: existing Device %d out of range for %d registered external devices", i, r.Device, len(fsys.devices))
+			}
+		} else if r.Device >= fsys.copyDeviceCount {
 			return nil, fmt.Errorf("DataRange[%d]: Device %d out of range for %d declared external devices", i, r.Device, fsys.copyDeviceCount)
 		}
 		deviceID := r.Device + 1
+		if r.Existing {
+			deviceID = r.Device
+		}
 		startBlock := uint64(r.Offset) / blockSize
 		totalBlocks := (uint64(r.Size) + blockSize - 1) / blockSize
 		for totalBlocks > 0 {
@@ -1449,9 +1458,10 @@ func (fsys *Writer) chunksFromRanges(ranges []DataRange, fileSize int64) ([]buil
 				count = 65535
 			}
 			chunks = append(chunks, builder.Chunk{
-				PhysicalBlock: startBlock,
-				Count:         uint16(count),
-				DeviceID:      deviceID,
+				PhysicalBlock:    startBlock,
+				Count:            uint16(count),
+				DeviceID:         deviceID,
+				AbsoluteDeviceID: r.Existing,
 			})
 			startBlock += count
 			totalBlocks -= count
