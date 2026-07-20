@@ -87,6 +87,8 @@ type SourceEntries struct {
 	Entries              []SourceEntry
 	BlockSize            uint32
 	ExternalDeviceBlocks []uint64
+	RemovePaths          []string
+	OpaquePaths          []string
 }
 
 // --- Constructor ---
@@ -636,6 +638,12 @@ func (fsys *Writer) CopyEntries(src SourceEntries, opts ...CopyOpt) error {
 		fsys.devices = append(fsys.devices, src.ExternalDeviceBlocks...)
 		fsys.copyDeviceID = uint16(len(fsys.devices) - len(src.ExternalDeviceBlocks) + 1)
 		fsys.copyDeviceCount = uint16(len(src.ExternalDeviceBlocks))
+	}
+	for _, p := range src.RemovePaths {
+		fsys.remove(p)
+	}
+	for _, p := range src.OpaquePaths {
+		fsys.removeChildren(p)
 	}
 	entries := append([]SourceEntry(nil), src.Entries...)
 	sort.Slice(entries, func(i, j int) bool { return cleanPath(entries[i].Path) < cleanPath(entries[j].Path) })
