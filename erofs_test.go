@@ -158,6 +158,77 @@ func TestOpenTarIndexWithoutCompression(t *testing.T) {
 	}
 }
 
+func TestCopyFromTarIndexLargeDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mkfs.erofs tar-index mode is not included on Windows")
+	}
+	if _, err := erofstest.CheckMkfsVersion("1.0"); err != nil {
+		t.Skipf("skipping: %v", err)
+	}
+
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "data.tar")
+	tarFile, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make(chan erofstest.WriterToTar)
+	go func() {
+		entries <- erofstest.TarContext{}.Dir("/many", 0o755)
+		for i := range 5000 {
+			entries <- erofstest.TarContext{}.File(fmt.Sprintf("/many/file-%d.txt", i+1), []byte("content\n"), 0o644)
+		}
+		close(entries)
+	}()
+	tarStream := erofstest.TarFromWriterTo(erofstest.TarAll(erofstest.TarStream(entries)))
+	if _, err := io.Copy(tarFile, tarStream); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarStream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	imagePath := filepath.Join(dir, "meta.erofs")
+	if out, err := exec.Command("mkfs.erofs", "--tar=i", imagePath, tarPath).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs.erofs --tar=i: %v\n%s", err, out)
+	}
+	imageFile, err := os.Open(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = imageFile.Close() }()
+	dataFile, err := os.Open(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dataFile.Close() }()
+	base, err := erofs.Open(imageFile, erofs.WithExtraDevices(dataFile))
+	if err != nil {
+		t.Fatal("open base:", err)
+	}
+
+	var copied testBuffer
+	writer := erofs.Create(&copied)
+	if err := writer.CopyFrom(base, erofs.MetadataOnly()); err != nil {
+		t.Fatal("copy base:", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal("close copied image:", err)
+	}
+	result, err := erofs.Open(bytes.NewReader(copied.Bytes()), erofs.WithExtraDevices(dataFile))
+	if err != nil {
+		t.Fatal("open copied image:", err)
+	}
+	for _, name := range []string{"many/file-1.txt", "many/file-2500.txt", "many/file-5000.txt"} {
+		if _, err := fs.Stat(result, name); err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+	}
+}
+
 func BenchmarkLookup(b *testing.B) {
 	if _, err := erofstest.CheckMkfsVersion("1.0"); err != nil {
 		b.Skipf("skipping: %v", err)
