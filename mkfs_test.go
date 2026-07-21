@@ -320,6 +320,46 @@ func TestCopyFromPreservesHardlinkIdentity(t *testing.T) {
 	}
 }
 
+func TestCopyFromImageLargeInlineDirectory(t *testing.T) {
+	var source testBuffer
+	base := erofs.Create(&source)
+	for i := range 512 {
+		f, err := base.Create(fmt.Sprintf("/many/file-%04d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := base.Close(); err != nil {
+		t.Fatal("close base:", err)
+	}
+
+	src, err := erofs.Open(bytes.NewReader(source.Bytes()))
+	if err != nil {
+		t.Fatal("open base:", err)
+	}
+	var copied testBuffer
+	dst := erofs.Create(&copied)
+	if err := dst.CopyFrom(src, erofs.MetadataOnly()); err != nil {
+		t.Fatal("copy base:", err)
+	}
+	if err := dst.Close(); err != nil {
+		t.Fatal("close copied image:", err)
+	}
+
+	result, err := erofs.Open(bytes.NewReader(copied.Bytes()))
+	if err != nil {
+		t.Fatal("open copied image:", err)
+	}
+	for _, name := range []string{"many/file-0000", "many/file-0256", "many/file-0511"} {
+		if _, err := fs.Stat(result, name); err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+	}
+}
+
 func TestCopyEntriesMetadataOnlyDataRange(t *testing.T) {
 	data := bytes.Repeat([]byte("range"), 819)
 	data = append(data, 0)
