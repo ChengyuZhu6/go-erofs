@@ -323,7 +323,7 @@ func TestCopyFromPreservesHardlinkIdentity(t *testing.T) {
 func TestCopyFromImageLargeInlineDirectory(t *testing.T) {
 	var source testBuffer
 	base := erofs.Create(&source)
-	for i := range 512 {
+	for i := range 5000 {
 		f, err := base.Create(fmt.Sprintf("/many/file-%04d", i))
 		if err != nil {
 			t.Fatal(err)
@@ -353,7 +353,7 @@ func TestCopyFromImageLargeInlineDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal("open copied image:", err)
 	}
-	for _, name := range []string{"many/file-0000", "many/file-0256", "many/file-0511"} {
+	for _, name := range []string{"many/file-0000", "many/file-2500", "many/file-4999"} {
 		if _, err := fs.Stat(result, name); err != nil {
 			t.Fatalf("stat %s: %v", name, err)
 		}
