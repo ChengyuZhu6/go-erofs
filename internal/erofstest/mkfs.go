@@ -58,7 +58,8 @@ func parseVersion(s string) (semver, error) {
 		}
 	}
 	if len(parts) >= 3 {
-		v.patch, err = strconv.Atoi(parts[2])
+		patch, _, _ := strings.Cut(parts[2], "-")
+		v.patch, err = strconv.Atoi(patch)
 		if err != nil {
 			return v, fmt.Errorf("invalid patch version: %w", err)
 		}

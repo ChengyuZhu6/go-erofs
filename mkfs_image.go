@@ -224,35 +224,16 @@ func (fsys *Writer) copyFromImage(img *image) error {
 
 		switch typ {
 		case disk.StatTypeDir:
-			dirSize := int(size)
-			if dirSize > 0 {
-				var dirData []byte
-				switch layout {
-				case disk.LayoutFlatPlain:
-					dataAddr := int64(idata) << blkBits
-					d := at(dataAddr)
-					if d != nil && len(d) >= dirSize {
-						dirData = d[:dirSize]
-					} else {
-						dirData = make([]byte, dirSize)
-						if _, err := img.meta.ReadAt(dirData, dataAddr); err != nil {
-							return fmt.Errorf("read dir data for nid %d: %w", cur.nid, err)
-						}
-					}
-				case disk.LayoutFlatInline:
-					d := at(trailingAddr)
-					if d != nil && len(d) >= dirSize {
-						dirData = d[:dirSize]
-					} else {
-						dirData = make([]byte, dirSize)
-						if _, err := img.meta.ReadAt(dirData, trailingAddr); err != nil {
-							return fmt.Errorf("read inline dir data for nid %d: %w", cur.nid, err)
-						}
-					}
+			entries, err := img.directoryEntries(cur.nid)
+			if err != nil {
+				return fmt.Errorf("read directory nid %d: %w", cur.nid, err)
+			}
+			for _, entry := range entries {
+				childPath := cur.path + "/" + entry.name
+				if cur.path == "/" {
+					childPath = "/" + entry.name
 				}
-				if dirData != nil {
-					fsys.parseDirBlock(dirData, dirSize, blockSize, cur.path, &queue)
-				}
+				queue = append(queue, imgQEntry{nid: entry.nid, path: childPath})
 			}
 
 		case disk.StatTypeSymlink:
@@ -321,60 +302,26 @@ func (fsys *Writer) copyFromImage(img *image) error {
 	return nil
 }
 
-// parseDirBlock extracts directory entries from dirent data and enqueues
-// child inodes for BFS traversal.
-func (fsys *Writer) parseDirBlock(data []byte, dirSize, blockSize int, parentPath string, queue *[]imgQEntry) {
-	pos := 0
-	for pos < dirSize {
-		blockEnd := pos + blockSize
-		if blockEnd > dirSize {
-			blockEnd = dirSize
-		}
-		blk := data[pos:blockEnd]
-		if len(blk) < disk.SizeDirent {
-			break
-		}
+type imgDirEntry struct {
+	nid  uint64
+	name string
+}
 
-		firstNameOff := binary.LittleEndian.Uint16(blk[8:10])
-		nEntries := int(firstNameOff / disk.SizeDirent)
-		if nEntries == 0 || nEntries*disk.SizeDirent > len(blk) {
-			break
-		}
-
-		for i := 0; i < nEntries; i++ {
-			off := i * disk.SizeDirent
-			nid := binary.LittleEndian.Uint64(blk[off : off+8])
-			nameOff := int(binary.LittleEndian.Uint16(blk[off+8 : off+10]))
-
-			var nameEnd int
-			if i < nEntries-1 {
-				nameEnd = int(binary.LittleEndian.Uint16(blk[(i+1)*disk.SizeDirent+8 : (i+1)*disk.SizeDirent+10]))
-			} else {
-				nameEnd = len(blk)
-			}
-			if nameOff >= len(blk) || nameEnd > len(blk) || nameOff >= nameEnd {
-				continue
-			}
-
-			// Extract name, trimming trailing NUL padding.
-			nameBytes := blk[nameOff:nameEnd]
-			for len(nameBytes) > 0 && nameBytes[len(nameBytes)-1] == 0 {
-				nameBytes = nameBytes[:len(nameBytes)-1]
-			}
-			name := string(nameBytes)
-			if name == "." || name == ".." || name == "" {
-				continue
-			}
-
-			childPath := parentPath + "/" + name
-			if parentPath == "/" {
-				childPath = "/" + name
-			}
-			*queue = append(*queue, imgQEntry{nid: nid, path: childPath})
-		}
-
-		pos = blockEnd
+func (img *image) directoryEntries(nid uint64) ([]imgDirEntry, error) {
+	d := &dir{file: file{img: img, nid: nid}}
+	entries, err := d.ReadDir(-1)
+	if err != nil {
+		return nil, err
 	}
+	result := make([]imgDirEntry, 0, len(entries))
+	for _, entry := range entries {
+		de, ok := entry.(*direntry)
+		if !ok {
+			return nil, fmt.Errorf("unexpected directory entry type %T", entry)
+		}
+		result = append(result, imgDirEntry{nid: de.nid, name: de.name})
+	}
+	return result, nil
 }
 
 // parseChunks extracts chunk index entries from an in-memory buffer.
