@@ -1548,6 +1548,91 @@ func TestMetadataOnlyNoFileData(t *testing.T) {
 		}
 		t.Logf("metadata: %d bytes, data file: %d bytes", len(meta.Bytes()), dfInfo.Size())
 	})
+
+	t.Run("new data follows copied external devices", func(t *testing.T) {
+		basePath := filepath.Join(t.TempDir(), "base.bin")
+		baseData, err := os.Create(basePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var baseMeta testBuffer
+		baseWriter := erofs.Create(&baseMeta, erofs.WithDataFile(baseData))
+		baseFile, err := baseWriter.Create("/base.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := baseFile.Write([]byte("base\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := baseFile.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := baseWriter.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := baseData.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		baseBytes, err := os.ReadFile(basePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base, err := erofs.Open(bytes.NewReader(baseMeta.Bytes()), erofs.WithExtraDevices(bytes.NewReader(baseBytes)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		newPath := filepath.Join(t.TempDir(), "new.bin")
+		newData, err := os.Create(newPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resultMeta testBuffer
+		result := erofs.Create(&resultMeta, erofs.WithDataFile(newData))
+		if err := result.CopyFrom(base, erofs.MetadataOnly()); err != nil {
+			t.Fatal(err)
+		}
+		if err := result.ReserveDataDevice(); err != nil {
+			t.Fatal(err)
+		}
+		newFile, err := result.Create("/new.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := newFile.Write([]byte("new\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := newFile.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := result.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := newData.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		newBytes, err := os.ReadFile(newPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		image, err := erofs.Open(bytes.NewReader(resultMeta.Bytes()), erofs.WithExtraDevices(bytes.NewReader(baseBytes), bytes.NewReader(newBytes)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, want := range map[string]string{"base.txt": "base\n", "new.txt": "new\n"} {
+			got, err := fs.ReadFile(image, name)
+			if err != nil || string(got) != want {
+				t.Fatalf("read %s: %q, %v; want %q", name, got, err, want)
+			}
+		}
+		if ranges := statDataRange(t, image, "base.txt"); ranges[0].Device != 1 {
+			t.Fatalf("base device=%d, want 1", ranges[0].Device)
+		}
+		if ranges := statDataRange(t, image, "new.txt"); ranges[0].Device != 2 {
+			t.Fatalf("new device=%d, want 2", ranges[0].Device)
+		}
+	})
 }
 
 // chunkedFS is a test fs.FS that provides entries with pre-existing chunk

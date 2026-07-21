@@ -40,13 +40,14 @@ type Writer struct {
 	copyDeviceID     uint16 // device ID assigned to current MetadataOnly CopyFrom
 	copyDeviceCount  uint16 // external devices declared by current MetadataOnly CopyFrom
 
-	dataFile *os.File // external data file (nil = spool mode)
-	dataOff  int64    // current byte offset in data file
-	spool    *os.File // temp spool (created lazily)
-	spoolOff int64    // current byte offset in spool
-	tempDir  string   // from WithTempDir
-	cpBuf    []byte   // shared buffer for io.Copy into File
-	padBuf   []byte   // shared zero buffer for padding (block-sized, lazy)
+	dataFile     *os.File // external data file (nil = spool mode)
+	dataOff      int64    // current byte offset in data file
+	dataDeviceID uint16
+	spool        *os.File // temp spool (created lazily)
+	spoolOff     int64    // current byte offset in spool
+	tempDir      string   // from WithTempDir
+	cpBuf        []byte   // shared buffer for io.Copy into File
+	padBuf       []byte   // shared zero buffer for padding (block-sized, lazy)
 }
 
 // File is a writable regular file returned by Writer.Create.
@@ -124,10 +125,6 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 	}
 
 	if o.dataFile != nil {
-		// Reserve device slot 0 (DeviceID=1) for the data file.
-		// MetadataOnly CopyFrom device IDs will start at slot 1+.
-		// The reserved slot is filled in with the actual block count at Close.
-		fsys.devices = append(fsys.devices, 0)
 		off, err := o.dataFile.Seek(0, io.SeekEnd)
 		if err == nil {
 			fsys.dataOff = off
@@ -186,11 +183,22 @@ func WithBuildTime(sec uint64, nsec uint32) CreateOpt {
 
 // WithDataFile sets an external data file for metadata-only mode.
 // File.Write appends to this file at block-aligned offsets; chunk
-// indexes reference those blocks with DeviceID=1.
+// indexes reference the device allocated when local data is first written.
 func WithDataFile(f *os.File) CreateOpt {
 	return func(o *createOptions) {
 		o.dataFile = f
 	}
+}
+
+// ReserveDataDevice registers the data file as the next external device.
+// Metadata-only callers that wrote changed data into the file separately must
+// call this after copying their existing devices and before adding ranges that
+// reference the new device.
+func (fsys *Writer) ReserveDataDevice() error {
+	if fsys.dataFile == nil {
+		return fmt.Errorf("mkfs: data file is not configured")
+	}
+	return fsys.ensureDataDevice()
 }
 
 // WithTempDir overrides the temp directory for the spool file.
@@ -797,10 +805,14 @@ func (fsys *Writer) Close() error {
 
 	fsys.resolveBlockSize()
 
+	// A configured data file always gets a device slot, even when nothing was
+	// written to it, so that readers can pass it via WithExtraDevices.
 	if fsys.dataFile != nil {
-		// Fill in the reserved device slot 0 with the actual block count.
+		if err := fsys.ensureDataDevice(); err != nil {
+			return err
+		}
 		blocks := (fsys.dataOff + int64(fsys.blockSize) - 1) / int64(fsys.blockSize)
-		fsys.devices[0] = uint64(blocks)
+		fsys.devices[fsys.dataDeviceID-1] = uint64(blocks)
 	}
 
 	buildTime := fsys.buildTime
@@ -1025,6 +1037,9 @@ func (f *File) Write(p []byte) (int, error) {
 	}
 
 	if f.fs.dataFile != nil {
+		if err := f.fs.ensureDataDevice(); err != nil {
+			return 0, err
+		}
 		n, err := f.fs.dataFile.Write(p)
 		f.written += int64(n)
 		f.fs.dataOff += int64(n)
@@ -1619,6 +1634,9 @@ func (fsys *Writer) add(p string, info fs.FileInfo, hardlinks map[hardlinkKey]*f
 		ino.chunks = nil
 		ino.contiguous = false
 		if fsys.dataFile != nil {
+			if err := fsys.ensureDataDevice(); err != nil {
+				return err
+			}
 			// Data file mode: copy through File for block-aligned padding and chunk recording.
 			f := &File{fs: fsys, entry: fe}
 			f.dataStartOff = fsys.dataOff
@@ -2052,12 +2070,24 @@ func (f *File) closeDataFile() error {
 		f.entry.ino.chunks = append(f.entry.ino.chunks, builder.Chunk{
 			PhysicalBlock: startBlock,
 			Count:         uint16(count),
-			DeviceID:      1,
+			DeviceID:      f.fs.dataDeviceID,
 		})
 		startBlock += count
 		totalBlocks -= count
 	}
 
+	return nil
+}
+
+func (fsys *Writer) ensureDataDevice() error {
+	if fsys.dataDeviceID != 0 {
+		return nil
+	}
+	if len(fsys.devices) >= int(^uint16(0)) {
+		return fmt.Errorf("mkfs: too many external devices")
+	}
+	fsys.devices = append(fsys.devices, 0)
+	fsys.dataDeviceID = uint16(len(fsys.devices))
 	return nil
 }
 
