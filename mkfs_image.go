@@ -243,6 +243,11 @@ func (fsys *Writer) copyFromImage(img *image) error {
 					d := at(trailingAddr)
 					if d != nil && len(d) >= dirSize {
 						dirData = d[:dirSize]
+					} else {
+						dirData = make([]byte, dirSize)
+						if _, err := img.meta.ReadAt(dirData, trailingAddr); err != nil {
+							return fmt.Errorf("read inline dir data for nid %d: %w", cur.nid, err)
+						}
 					}
 				}
 				if dirData != nil {
