@@ -261,7 +261,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 						chunkAddr = (chunkAddr + 7) & ^int64(7)
 					}
 					fe.chunks = fsys.parseChunks(at(chunkAddr), chunkFmt, size, blkBits, img.deviceIDMask)
-					fe.contiguous = true
+					fe.contiguous = chunksAreContiguous(fe.chunks, size, blkBits)
 				}
 			}
 
@@ -328,7 +328,7 @@ func (img *image) directoryEntries(nid uint64) ([]imgDirEntry, error) {
 func (fsys *Writer) parseChunks(data []byte, chunkFmt uint16, fileSize uint64, blkBits uint8, deviceIDMask uint16) []builder.Chunk {
 	chunkBits := blkBits + uint8(chunkFmt&disk.LayoutChunkFormatBits)
 	nchunks := int((fileSize-1)>>chunkBits) + 1
-	blocksPerChunk := 1 << (chunkBits - blkBits)
+	blocksPerChunk := uint64(1) << (chunkBits - blkBits)
 
 	// Align to 8 bytes for index entries.
 	needed := nchunks * disk.SizeChunkIndex
@@ -341,28 +341,74 @@ func (fsys *Writer) parseChunks(data []byte, chunkFmt uint16, fileSize uint64, b
 		off := i * disk.SizeChunkIndex
 		startBlkLo := binary.LittleEndian.Uint32(data[off+4 : off+8])
 		if ^startBlkLo == 0 {
-			continue // null/hole
+			// Preserve null indexes so later data remains at the correct logical
+			// position. appendChunkRun splits long holes at the uint16 Count limit.
+			chunks = appendChunkRun(chunks, builder.NullPhysicalBlock, blocksPerChunk, 0)
+			continue
 		}
 		startBlkHi := binary.LittleEndian.Uint16(data[off : off+2])
 		deviceID := binary.LittleEndian.Uint16(data[off+2:off+4]) & deviceIDMask
 		physBlock := (uint64(startBlkHi) << 32) | uint64(startBlkLo)
 
+		chunks = appendChunkRun(chunks, physBlock, blocksPerChunk, deviceID)
+	}
+	return chunks
+}
+
+func appendChunkRun(chunks []builder.Chunk, physicalBlock, count uint64, deviceID uint16) []builder.Chunk {
+	const maxChunkBlocks = uint64(^uint16(0))
+
+	for count > 0 {
 		if len(chunks) > 0 {
 			prev := &chunks[len(chunks)-1]
-			if prev.DeviceID == deviceID &&
-				prev.PhysicalBlock+uint64(prev.Count) == physBlock &&
-				int(prev.Count)+blocksPerChunk <= 65535 {
-				prev.Count += uint16(blocksPerChunk)
+			sameRun := physicalBlock == builder.NullPhysicalBlock && prev.PhysicalBlock == builder.NullPhysicalBlock
+			if physicalBlock != builder.NullPhysicalBlock && prev.PhysicalBlock != builder.NullPhysicalBlock {
+				sameRun = prev.DeviceID == deviceID && prev.PhysicalBlock+uint64(prev.Count) == physicalBlock
+			}
+			if sameRun && uint64(prev.Count) < maxChunkBlocks {
+				n := min(count, maxChunkBlocks-uint64(prev.Count))
+				prev.Count += uint16(n)
+				count -= n
+				if physicalBlock != builder.NullPhysicalBlock {
+					physicalBlock += n
+				}
 				continue
 			}
 		}
+
+		n := min(count, maxChunkBlocks)
 		chunks = append(chunks, builder.Chunk{
-			PhysicalBlock: physBlock,
-			Count:         uint16(blocksPerChunk),
+			PhysicalBlock: physicalBlock,
+			Count:         uint16(n),
 			DeviceID:      deviceID,
 		})
+		count -= n
+		if physicalBlock != builder.NullPhysicalBlock {
+			physicalBlock += n
+		}
 	}
 	return chunks
+}
+
+func chunksAreContiguous(chunks []builder.Chunk, fileSize uint64, blkBits uint8) bool {
+	if len(chunks) == 0 || fileSize == 0 {
+		return false
+	}
+
+	deviceID := chunks[0].DeviceID
+	expectedBlock := chunks[0].PhysicalBlock
+	var coveredBlocks uint64
+	for _, chunk := range chunks {
+		if chunk.Count == 0 || chunk.PhysicalBlock == builder.NullPhysicalBlock ||
+			chunk.DeviceID != deviceID || chunk.PhysicalBlock != expectedBlock {
+			return false
+		}
+		count := uint64(chunk.Count)
+		expectedBlock += count
+		coveredBlocks += count
+	}
+	requiredBlocks := ((fileSize - 1) >> blkBits) + 1
+	return coveredBlocks >= requiredBlocks
 }
 
 // parseXattrsFromBuf parses xattr entries from an in-memory buffer.
