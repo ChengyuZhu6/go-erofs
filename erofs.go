@@ -83,6 +83,9 @@ var (
 //	InodeInfo:  Ino() uint64, Nlink() uint64
 //	DeviceInfo: Rdev() uint64
 //	Xattrs:     GetAllXattr() map[string]string, GetXattr(string) (string, bool)
+//
+// Mode has no accessor interface: use [fs.FileInfo.Mode], which returns the
+// same value, including the setuid, setgid and sticky bits.
 type Stat struct {
 	Mode        fs.FileMode
 	Size        int64
@@ -1005,7 +1008,7 @@ func (b *file) readInfo() (ino *inode, err error) {
 			inodeLayout: layout,
 			inodeData:   di.InodeData,
 			size:        int64(di.Size),
-			mode:        (fs.FileMode(di.Mode) & ^fs.ModeType) | b.ftype,
+			mode:        (disk.EroFSModeToGoFileMode(di.Mode) & ^fs.ModeType) | b.ftype,
 			rawMode:     di.Mode,
 			uid:         uint32(di.UID),
 			gid:         uint32(di.GID),
@@ -1026,7 +1029,7 @@ func (b *file) readInfo() (ino *inode, err error) {
 			inodeLayout: layout,
 			inodeData:   di.InodeData,
 			size:        int64(di.Size),
-			mode:        (fs.FileMode(di.Mode) & ^fs.ModeType) | b.ftype,
+			mode:        (disk.EroFSModeToGoFileMode(di.Mode) & ^fs.ModeType) | b.ftype,
 			rawMode:     di.Mode,
 			uid:         di.UID,
 			gid:         di.GID,

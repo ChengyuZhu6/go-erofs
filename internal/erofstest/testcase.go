@@ -321,6 +321,54 @@ var LongXattrs TestCase = &testCase{
 	},
 }
 
+// SpecialModeBits checks that setuid, setgid and sticky bits survive the
+// round trip into fs.FileInfo.Mode, and that the mode reported by Mode() is
+// a well-formed fs.FileMode (no raw on-disk bits) for ordinary entries too.
+var SpecialModeBits TestCase = &testCase{
+	tar: func() WriterToTar {
+		tc := TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+		return TarAll(
+			tc.Dir("/bin", 0755),
+			tc.File("/bin/su", []byte("setuid\n"), 0755|fs.ModeSetuid),
+			tc.File("/bin/wall", []byte("setgid\n"), 0755|fs.ModeSetgid),
+			tc.File("/bin/all-bits", []byte("all\n"), 0700|fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky),
+			tc.File("/bin/plain", []byte("plain\n"), 0644),
+			tc.Symlink("/bin/su", "/bin/su-link"),
+			tc.Dir("/tmp", 0777|fs.ModeSticky),
+			tc.Dir("/var", 0775|fs.ModeSetgid),
+			tc.Dir("/dev", 0755),
+			tc.Device("/dev/null", fs.ModeCharDevice, 1, 3),
+			tc.Device("/dev/loop0", fs.ModeDevice, 7, 0),
+			tc.Device("/dev/initctl", fs.ModeNamedPipe, 0, 0),
+		)
+	},
+	verify: func(t testing.TB, fsys fs.FS) {
+		t.Helper()
+
+		CheckMode(t, fsys, "bin/su", 0755|fs.ModeSetuid)
+		CheckMode(t, fsys, "bin/wall", 0755|fs.ModeSetgid)
+		CheckMode(t, fsys, "bin/all-bits", 0700|fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky)
+		CheckMode(t, fsys, "bin/plain", 0644)
+		CheckMode(t, fsys, "bin/su-link", 0777|fs.ModeSymlink)
+		CheckMode(t, fsys, "bin", 0755|fs.ModeDir)
+		CheckMode(t, fsys, "tmp", 0777|fs.ModeDir|fs.ModeSticky)
+		CheckMode(t, fsys, "var", 0775|fs.ModeDir|fs.ModeSetgid)
+		CheckMode(t, fsys, "dev/null", 0600|fs.ModeDevice|fs.ModeCharDevice)
+		CheckMode(t, fsys, "dev/loop0", 0600|fs.ModeDevice)
+		CheckMode(t, fsys, "dev/initctl", 0600|fs.ModeNamedPipe)
+
+		// The natural "copy this out to disk" path: os.Chmod only applies
+		// setuid/setgid/sticky when the fs.Mode* flags are set.
+		fi, err := fs.Stat(fsys, "bin/su")
+		if err != nil {
+			t.Fatalf("stat bin/su: %v", err)
+		}
+		if fi.Mode()&fs.ModeSetuid == 0 {
+			t.Errorf("bin/su: mode %v (%#o) has no fs.ModeSetuid", fi.Mode(), uint32(fi.Mode()))
+		}
+	},
+}
+
 // FileSizes tests files at layout-significant size boundaries:
 //   - 4096 bytes: exactly one block
 //   - 4097 bytes: just over one block (exercises partial second block)

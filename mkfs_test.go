@@ -446,6 +446,84 @@ func TestCreateFSImplicitDirs(t *testing.T) {
 	}
 }
 
+// TestCreateFSSpecialModeBits verifies that setuid, setgid and sticky bits
+// written by the Writer are reported by the reader's fs.FileInfo.Mode, and
+// that plain entries come back as well-formed fs.FileMode values with no raw
+// on-disk bits left in them.
+func TestCreateFSSpecialModeBits(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	for _, f := range []struct {
+		name string
+		mode fs.FileMode
+	}{
+		{"/su", 0755 | fs.ModeSetuid},
+		{"/wall", 0755 | fs.ModeSetgid},
+		{"/all-bits", 0700 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky},
+		{"/plain", 0644},
+	} {
+		fh, err := fsys.Create(f.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fh.Write([]byte(f.name)); err != nil {
+			t.Fatal(err)
+		}
+		if err := fh.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := fsys.Chmod(f.name, f.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := fsys.Mkdir("/tmp", 0777|fs.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Mkdir("/var", 0775|fs.ModeSetgid); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Symlink("/su", "/su-link"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Mknod("/null", disk.StatTypeChrdev|0666, 0x0103); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("EroFS:", err)
+	}
+
+	erofstest.CheckMode(t, efs, "su", 0755|fs.ModeSetuid)
+	erofstest.CheckMode(t, efs, "wall", 0755|fs.ModeSetgid)
+	erofstest.CheckMode(t, efs, "all-bits", 0700|fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky)
+	erofstest.CheckMode(t, efs, "plain", 0644)
+	erofstest.CheckMode(t, efs, "tmp", 0777|fs.ModeDir|fs.ModeSticky)
+	erofstest.CheckMode(t, efs, "var", 0775|fs.ModeDir|fs.ModeSetgid)
+	erofstest.CheckMode(t, efs, "su-link", 0777|fs.ModeSymlink)
+	erofstest.CheckMode(t, efs, "null", 0666|fs.ModeDevice|fs.ModeCharDevice)
+
+	// Writer and reader must agree on the mode they report for an entry.
+	wfi, err := fsys.Stat("/su")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rfi, err := fs.Stat(efs, "su")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wfi.Mode() != rfi.Mode() {
+		t.Errorf("su: writer mode %v (%#o), reader mode %v (%#o)",
+			wfi.Mode(), uint32(wfi.Mode()), rfi.Mode(), uint32(rfi.Mode()))
+	}
+}
+
 // TestCreateFSEmpty verifies that an empty FS produces a valid image.
 func TestCreateFSEmpty(t *testing.T) {
 	var buf testBuffer
