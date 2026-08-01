@@ -216,15 +216,17 @@ func (fsys *Writer) Create(name string) (*File, error) {
 	return f, nil
 }
 
-// Mkdir creates a directory. Only permission bits from perm are used;
-// type bits are forced to directory. Mkdir("/", perm) sets root permissions.
+// Mkdir creates a directory. Only permission bits from perm are used,
+// including setuid, setgid and sticky as os.Mkdir does; type bits are forced
+// to directory. Mkdir("/", perm) sets root permissions.
 func (fsys *Writer) Mkdir(name string, perm fs.FileMode) error {
 	if fsys.wErr != nil {
 		return fsys.wErr
 	}
+	dirMode := disk.StatTypeDir | goModeToUnixMode(perm)&0o7777
 	name = cleanPath(name)
 	if name == "/" {
-		fsys.root.mode = disk.StatTypeDir | uint16(perm.Perm())
+		fsys.root.mode = dirMode
 		return nil
 	}
 	if err := fsys.checkPath(name); err != nil {
@@ -235,7 +237,7 @@ func (fsys *Writer) Mkdir(name string, perm fs.FileMode) error {
 
 	e := &fsEntry{
 		path: name,
-		mode: disk.StatTypeDir | uint16(perm.Perm()),
+		mode: dirMode,
 	}
 	fsys.addChild(e)
 
