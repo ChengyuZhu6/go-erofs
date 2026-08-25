@@ -72,9 +72,7 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 				e.layout = disk.LayoutFlatPlain
 			case len(e.chunks) > 0 || e.metadataOnly:
 				e.layout = disk.LayoutChunkBased
-				if e.contiguous {
-					e.chunkBits = w.minChunkBits(e.size)
-				}
+				e.chunkBits = w.chunkBitsFor(e)
 			default:
 				// Full-image mode: decide inline vs plain
 				if int(e.size) <= w.blockSize-headerSize {

@@ -2422,6 +2422,62 @@ func TestCopyFromDataRange(t *testing.T) {
 		}
 	})
 
+	t.Run("aligned holes coarsen chunk indexes", func(t *testing.T) {
+		// 16MiB data + 16MiB hole. 4KiB indexes would be 64KiB of map;
+		// mergechunks should emit two 16MiB indexes.
+		const half = 16 << 20
+		device := bytes.Repeat([]byte{0xAB}, half)
+		src := &dataRangerFS{
+			deviceBlocks: uint64(half / blockSize),
+			file: &dataRangerFileInfo{
+				name: "sparse.bin",
+				size: half * 2,
+				ranges: []erofs.DataRange{
+					{Device: 0, Offset: 0, Size: half},
+					{Offset: -1, Size: half},
+				},
+			},
+		}
+
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		if err := w.CopyFrom(src, erofs.MetadataOnly()); err != nil {
+			t.Fatal("CopyFrom:", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal("Close:", err)
+		}
+		if n := len(buf.Bytes()); n >= 32*1024 {
+			t.Fatalf("metadata is %d bytes; 4KiB chunk indexes were not coarsened", n)
+		}
+
+		erofstest.FsckErofsBytes(t, buf.Bytes())
+
+		dstFS, err := erofs.Open(bytes.NewReader(buf.Bytes()),
+			erofs.WithExtraDevices(bytes.NewReader(device)))
+		if err != nil {
+			t.Fatal("Open:", err)
+		}
+		ranges := statDataRange(t, dstFS, "sparse.bin")
+		if len(ranges) != 2 {
+			t.Fatalf("DataRange() len = %d, want 2; ranges = %v", len(ranges), ranges)
+		}
+		if ranges[0].Offset != 0 || ranges[0].Size != half {
+			t.Errorf("ranges[0] = %+v, want Offset:0 Size:%d", ranges[0], half)
+		}
+		if ranges[1].Offset != -1 || ranges[1].Size != half {
+			t.Errorf("ranges[1] = %+v, want hole Size:%d", ranges[1], half)
+		}
+		got, err := fs.ReadFile(dstFS, "sparse.bin")
+		if err != nil {
+			t.Fatal("ReadFile:", err)
+		}
+		want := append(device, make([]byte, half)...)
+		if !bytes.Equal(got, want) {
+			t.Fatal("ReadFile mismatch after coarsening chunkBits")
+		}
+	})
+
 	t.Run("ranges span declared devices", func(t *testing.T) {
 		src := &dataRangerFS{
 			deviceTable: []uint64{1024, 1024},
