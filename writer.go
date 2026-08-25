@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"os"
 	"sort"
 
@@ -48,7 +49,7 @@ func inodeCoreSize(e *erofsEntry) int {
 }
 
 // entryChunkBits returns the chunk bits for a specific entry.
-// Contiguous entries use a larger chunk size to minimize chunk indexes.
+// Per-inode chunkBits (from chunkBitsFor) overrides the writer default.
 func (w *erofsWriter) entryChunkBits(e *erofsEntry) uint8 {
 	if e.chunkBits > 0 {
 		return e.chunkBits
@@ -64,11 +65,88 @@ func (w *erofsWriter) entryChunkSize(e *erofsEntry) int {
 // minChunkBits returns the minimum chunkBits such that file size fits in
 // one chunk (chunkSize >= size). Capped at 31 (LayoutChunkFormatBits max).
 func (w *erofsWriter) minChunkBits(size uint64) uint8 {
-	bits := w.chunkBits
-	for uint64(w.blockSize)<<bits < size && bits < 31 {
-		bits++
+	return minChunkBits(size, w.blockSize, w.chunkBits)
+}
+
+func minChunkBits(size uint64, blockSize int, floor uint8) uint8 {
+	b := floor
+	for uint64(blockSize)<<b < size && b < 31 {
+		b++
 	}
-	return bits
+	return b
+}
+
+// chunkBitsFor is mkfs.erofs erofs_blob_mergechunks: pick the largest
+// power-of-two chunk (in blocks) that keeps every on-disk index uniform.
+// Adjacent holes merge; physically contiguous same-device data merges.
+// A single run (whole-file data or whole-file hole) uses one index.
+func (w *erofsWriter) chunkBitsFor(e *erofsEntry) uint8 {
+	return chunkBitsFromChunks(e.chunks, e.size, w.blockSize, w.chunkBits)
+}
+
+func chunkBitsFromChunks(chunks []builder.Chunk, size uint64, blockSize int, floor uint8) uint8 {
+	if size == 0 {
+		return floor
+	}
+	if len(chunks) == 0 {
+		return minChunkBits(size, blockSize, floor)
+	}
+
+	fileBlocks := (size + uint64(blockSize) - 1) / uint64(blockSize)
+	minext := fileBlocks
+	nruns := 0
+	var runBlocks uint64
+	var haveRun, lastHole bool
+	var lastDev uint16
+	var lastNextPhys uint64
+
+	flush := func() {
+		if !haveRun || runBlocks == 0 {
+			return
+		}
+		nruns++
+		if lb := runBlocks & -runBlocks; lb != 0 && lb < minext {
+			minext = lb
+		}
+		haveRun = false
+		runBlocks = 0
+	}
+
+	for _, c := range chunks {
+		if c.Count == 0 {
+			continue
+		}
+		hole := c.PhysicalBlock == builder.NullPhysicalBlock
+		merge := haveRun && ((lastHole && hole) ||
+			(!lastHole && !hole && lastDev == c.DeviceID && c.PhysicalBlock == lastNextPhys))
+		if !merge {
+			flush()
+			haveRun = true
+			runBlocks = uint64(c.Count)
+		} else {
+			runBlocks += uint64(c.Count)
+		}
+		lastHole = hole
+		lastDev = c.DeviceID
+		if hole {
+			lastNextPhys = 0
+		} else {
+			lastNextPhys = c.PhysicalBlock + uint64(c.Count)
+		}
+	}
+	flush()
+
+	if nruns <= 1 {
+		return minChunkBits(size, blockSize, floor)
+	}
+	b := uint8(bits.TrailingZeros64(minext))
+	if b > 31 {
+		b = 31
+	}
+	if b < floor {
+		return floor
+	}
+	return b
 }
 
 func (w *erofsWriter) write(out io.WriteSeeker) error {
