@@ -424,6 +424,27 @@ func TestCopyEntriesAppliesTreePatch(t *testing.T) {
 	erofstest.CheckFile(t, efs, "dir/new", "new")
 }
 
+func TestCopyEntriesPreservesDeviceNodes(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+		{Path: "/null", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, Rdev: 1<<8 | 3},
+		{Path: "/sda", Mode: fs.ModeDevice | 0o660, Rdev: 8 << 8},
+	}}, erofs.MetadataOnly()); err != nil {
+		t.Fatal("CopyEntries:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	erofstest.CheckDevice(t, efs, "null", fs.ModeDevice|fs.ModeCharDevice, 1<<8|3)
+	erofstest.CheckDevice(t, efs, "sda", fs.ModeDevice, 8<<8)
+}
+
 // TestCreateFSMknod verifies char and block device creation.
 func TestCreateFSMknod(t *testing.T) {
 	var buf testBuffer

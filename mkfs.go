@@ -75,6 +75,7 @@ type SourceEntry struct {
 	Mode        fs.FileMode
 	Size        int64
 	UID, GID    uint32
+	Rdev        uint32
 	Mtime       time.Time
 	Xattrs      map[string]string
 	LinkTarget  string
@@ -716,6 +717,7 @@ func (fsys *Writer) copyEntry(entry SourceEntry) error {
 	be := &builder.Entry{
 		UID:        entry.UID,
 		GID:        entry.GID,
+		Rdev:       entry.Rdev,
 		Xattrs:     cloneXattrs(entry.Xattrs),
 		LinkTarget: entry.LinkTarget,
 		Data:       entry.Data,
