@@ -92,9 +92,7 @@ func chunkBitsFromChunks(chunks []builder.Chunk, size uint64, blockSize int, flo
 		return minChunkBits(size, blockSize, floor)
 	}
 
-	fileBlocks := (size + uint64(blockSize) - 1) / uint64(blockSize)
-	minext := fileBlocks
-	nruns := 0
+	var runs []uint64
 	var runBlocks uint64
 	var haveRun, lastHole bool
 	var lastDev uint16
@@ -104,10 +102,7 @@ func chunkBitsFromChunks(chunks []builder.Chunk, size uint64, blockSize int, flo
 		if !haveRun || runBlocks == 0 {
 			return
 		}
-		nruns++
-		if lb := runBlocks & -runBlocks; lb != 0 && lb < minext {
-			minext = lb
-		}
+		runs = append(runs, runBlocks)
 		haveRun = false
 		runBlocks = 0
 	}
@@ -136,8 +131,16 @@ func chunkBitsFromChunks(chunks []builder.Chunk, size uint64, blockSize int, flo
 	}
 	flush()
 
-	if nruns <= 1 {
+	if len(runs) <= 1 {
 		return minChunkBits(size, blockSize, floor)
+	}
+	// The final run may stop inside the last chunk. It must not force every
+	// earlier chunk down to 4KiB; the reader trims that chunk to i_size.
+	minext := uint64(1) << 63
+	for _, blocks := range runs[:len(runs)-1] {
+		if lb := blocks & -blocks; lb != 0 && lb < minext {
+			minext = lb
+		}
 	}
 	b := uint8(bits.TrailingZeros64(minext))
 	if b > 31 {
