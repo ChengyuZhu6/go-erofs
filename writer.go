@@ -310,7 +310,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 	if len(w.devices) > 0 {
 		featureIncompat |= disk.FeatureIncompatDeviceTable
 		extraDevices = uint16(len(w.devices))
-		devtSlotOff = uint16(disk.SizeSuperBlock / 16)
+		devtSlotOff = uint16((disk.SuperBlockOffset + disk.SizeSuperBlock) / disk.SizeDeviceSlot)
 	}
 	for _, e := range w.entries {
 		if len(e.chunks) > 0 {

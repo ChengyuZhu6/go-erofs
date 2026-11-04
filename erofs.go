@@ -147,7 +147,8 @@ type OverlayOpaque interface {
 }
 
 type options struct {
-	extraDevices []io.ReaderAt
+	extraDevices            []io.ReaderAt
+	allowCompressedMetadata bool
 }
 
 // OpenOpt is an option for configuring the EROFS reader
@@ -161,6 +162,17 @@ type Opt = OpenOpt
 func WithExtraDevices(devices ...io.ReaderAt) OpenOpt {
 	return func(o *options) {
 		o.extraDevices = append(o.extraDevices, devices...)
+	}
+}
+
+// WithCompressedMetadata allows directory traversal and metadata inspection of
+// images declaring compression algorithms. It does not enable decompression:
+// reading compressed file data returns ErrNotImplemented, and DataRange returns
+// nil for compressed inodes. Uncompressed files remain readable. Unknown
+// incompatible features are still rejected.
+func WithCompressedMetadata() OpenOpt {
+	return func(o *options) {
+		o.allowCompressedMetadata = true
 	}
 }
 
@@ -235,7 +247,7 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 
 	// LZ4_0Padding is a format compatibility bit. It does not imply that this
 	// image contains compressed inodes; ComprAlgs does.
-	if i.sb.ComprAlgs != 0 {
+	if i.sb.ComprAlgs != 0 && !o.allowCompressedMetadata {
 		return nil, fmt.Errorf("unsupported compressed filesystem (FeatureIncompat=0x%x, ComprAlgs=0x%x): %w",
 			i.sb.FeatureIncompat, i.sb.ComprAlgs, ErrNotImplemented)
 	}
@@ -718,10 +730,14 @@ func (img *image) loadBlock(fi *inode, pos int64) (*block, error) {
 		return nil, fmt.Errorf("invalid block bounds [%d:%d] for nid %d: %w", blockOffset, blockEnd, fi.nid, ErrInvalid)
 	}
 
+	reader, mappedAddr, err := img.mapDev(0, addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to map device for nid %d: %w", fi.nid, err)
+	}
 	b := img.getBlock()
 	b.offset = int32(blockOffset)
 	b.end = int32(blockEnd)
-	if n, err := img.meta.ReadAt(b.bytes(), addr+int64(blockOffset)); err != nil {
+	if n, err := reader.ReadAt(b.bytes(), mappedAddr+int64(blockOffset)); err != nil {
 		img.putBlock(b)
 		return nil, fmt.Errorf("failed to read block for nid %d: %w", fi.nid, err)
 	} else if n != blockEnd-blockOffset {
@@ -906,6 +922,9 @@ func (i *image) ReadFile(name string) ([]byte, error) {
 	fi, err := f.readInfo()
 	if err != nil {
 		return nil, err
+	}
+	if fi.inodeLayout == disk.LayoutCompressedFull || fi.inodeLayout == disk.LayoutCompressedCompact {
+		return nil, fmt.Errorf("compressed inode layout %d: %w", fi.inodeLayout, ErrNotImplemented)
 	}
 	if fi.size < 0 || fi.size > maxReadFileSize {
 		return nil, fmt.Errorf("file size %d exceeds ReadFile limit %d; use Open and io.Copy for large files: %w", fi.size, int64(maxReadFileSize), ErrInvalid)
@@ -1249,6 +1268,9 @@ func (b *file) Read(p []byte) (int, error) {
 	fi, err := b.readInfo()
 	if err != nil {
 		return 0, err
+	}
+	if fi.inodeLayout == disk.LayoutCompressedFull || fi.inodeLayout == disk.LayoutCompressedCompact {
+		return 0, fmt.Errorf("compressed inode layout %d: %w", fi.inodeLayout, ErrNotImplemented)
 	}
 
 	var n int

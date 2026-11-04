@@ -3,6 +3,7 @@ package erofs_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -100,6 +101,118 @@ func TestErofs(t *testing.T) {
 			t.Fatalf("expected ErrNotImplemented, got %v", err)
 		}
 	})
+}
+
+type rejectCompressedPayload struct {
+	reads int
+}
+
+func (r *rejectCompressedPayload) ReadAt([]byte, int64) (int, error) {
+	r.reads++
+	return 0, errors.New("unexpected payload read")
+}
+
+func TestOpenCompressedMetadata(t *testing.T) {
+	if _, err := erofstest.CheckMkfsVersion("1.0"); err != nil {
+		t.Skipf("skipping: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		flags  []string
+		layout uint8
+	}{
+		{"compact", []string{"-Eforce-inode-compact"}, 3},
+		{"extended", []string{"-Eforce-inode-extended,legacy-compress"}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := erofstest.TarContext{UID: 123, GID: 456, Xattrs: map[string]string{"user.test": "value"}}
+			large := bytes.Repeat([]byte("compressed payload"), 8192)
+			stream := erofstest.TarFromWriterTo(erofstest.TarAll(
+				ctx.Dir("/dir", 0755), ctx.File("/dir/large", large, 0640),
+				ctx.File("/small", []byte("small payload"), 0644),
+				ctx.Link("dir/large", "/hardlink"), ctx.Symlink("dir/large", "/symlink"),
+			))
+			defer func() { _ = stream.Close() }()
+			root := t.TempDir()
+			metaPath, dataPath := filepath.Join(root, "meta.erofs"), filepath.Join(root, "data.erofs")
+			flags := append([]string{"-zlz4", "--tar=f", "--blobdev=" + dataPath, "-Enoinline_data"}, tc.flags...)
+			if err := erofstest.ConvertTarErofs(context.Background(), stream, metaPath, "", flags); err != nil {
+				if bytes.Contains([]byte(err.Error()), []byte("--blobdev must be used together with --chunksize")) {
+					t.Skip("mkfs.erofs lacks compressed external-device support")
+				}
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(metaPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			denied := &rejectCompressedPayload{}
+			if _, err := erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(denied)); !errors.Is(err, erofs.ErrNotImplemented) {
+				t.Fatalf("default Open must still reject compressed filesystems: %v", err)
+			}
+			image, err := erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(denied), erofs.WithCompressedMetadata())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fs.WalkDir(image, ".", func(name string, entry fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				_, err = entry.Info()
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			info, err := fs.Stat(image, "dir/large")
+			if err != nil {
+				t.Fatal(err)
+			}
+			stat := info.Sys().(*erofs.Stat)
+			if info.Size() != int64(len(large)) || info.Mode().Perm() != 0640 || stat.UID != 123 || stat.GID != 456 || stat.InodeLayout != tc.layout || stat.Xattrs["user.test"] != "value" {
+				t.Fatalf("compressed metadata mismatch: size=%d mode=%v stat=%+v", info.Size(), info.Mode(), stat)
+			}
+			if ranges := info.(interface{ DataRange() []erofs.DataRange }).DataRange(); ranges != nil {
+				t.Fatalf("compressed DataRange must not expose decoded bytes as physical extents: %+v", ranges)
+			}
+			link, err := fs.Stat(image, "hardlink")
+			if err != nil || link.Sys().(*erofs.Stat).Ino != stat.Ino {
+				t.Fatalf("hardlink metadata mismatch: %v", err)
+			}
+			for _, name := range []string{"dir/large", "symlink"} {
+				file, err := image.Open(name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, readErr := file.Read(make([]byte, 1))
+				_ = file.Close()
+				if !errors.Is(readErr, erofs.ErrNotImplemented) {
+					t.Fatalf("compressed Read %s must reject data access: %v", name, readErr)
+				}
+				if _, err := fs.ReadFile(image, name); !errors.Is(err, erofs.ErrNotImplemented) {
+					t.Fatalf("compressed ReadFile %s must reject data access: %v", name, err)
+				}
+			}
+			if denied.reads != 0 {
+				t.Fatalf("metadata operations read external payload %d times", denied.reads)
+			}
+			data, err := os.Open(dataPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = data.Close() }()
+			image, err = erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(data), erofs.WithCompressedMetadata())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := fs.ReadFile(image, "small"); err != nil || string(got) != "small payload" {
+				t.Fatalf("uncompressed fallback unreadable: %q, %v", got, err)
+			}
+			binary.LittleEndian.PutUint32(raw[1104:1108], binary.LittleEndian.Uint32(raw[1104:1108])|0x80000000)
+			if _, err := erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(denied), erofs.WithCompressedMetadata()); !errors.Is(err, erofs.ErrNotImplemented) {
+				t.Fatalf("metadata option must not allow unknown features: %v", err)
+			}
+		})
+	}
 }
 
 func TestOpenTarIndexWithoutCompression(t *testing.T) {

@@ -1,10 +1,99 @@
 package erofs
 
 import (
+	"bytes"
+	"encoding/binary"
+	"io"
+	"os"
 	"testing"
 
 	"github.com/erofs/go-erofs/internal/builder"
+	"github.com/erofs/go-erofs/internal/disk"
 )
+
+func TestWriterDeviceTableRoundTrip(t *testing.T) {
+	meta, err := os.CreateTemp(t.TempDir(), "meta-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = meta.Close() }()
+	writer := Create(meta, WithBlockSize(4096))
+	if err := writer.CopyEntries(SourceEntries{
+		BlockSize:            4096,
+		ExternalDeviceBlocks: []uint64{2, 3},
+		Entries: []SourceEntry{{Path: "/file", Mode: 0o444, Size: 4096,
+			DataRanges: []DataRange{{Device: 1, Offset: 4096, Size: 4096}}}},
+	}, MetadataOnly()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	devices := []io.ReaderAt{bytes.NewReader(make([]byte, 8192)), bytes.NewReader(make([]byte, 12288))}
+	for generation := 1; generation <= 2; generation++ {
+		raw, err := os.ReadFile(meta.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		offset := int(binary.LittleEndian.Uint16(raw[1112:1114])) * 128
+		if offset != 1152 {
+			t.Fatalf("generation %d: device table offset = %d, want 1152", generation, offset)
+		}
+		for i, blocks := range []uint32{2, 3} {
+			if got := binary.LittleEndian.Uint32(raw[offset+i*128+64 : offset+i*128+68]); got != blocks {
+				t.Fatalf("generation %d device %d: blocks=%d, want %d", generation, i+1, got, blocks)
+			}
+		}
+		parent, err := Open(bytes.NewReader(raw), WithExtraDevices(devices...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, err := os.CreateTemp(t.TempDir(), "meta-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = next.Close() }()
+		child := Create(next, WithBlockSize(4096))
+		if err := child.CopyFrom(parent, MetadataOnly()); err != nil {
+			t.Fatal(err)
+		}
+		if err := child.Close(); err != nil {
+			t.Fatal(err)
+		}
+		meta = next
+	}
+}
+
+func TestLoadFlatMappedDevice(t *testing.T) {
+	payload := append(bytes.Repeat([]byte("a"), 4096), bytes.Repeat([]byte("b"), 4096)...)
+	for _, tc := range []struct {
+		name   string
+		layout uint8
+		pos    int64
+	}{
+		{"plain_first", disk.LayoutFlatPlain, 0},
+		{"plain_second", disk.LayoutFlatPlain, 4096},
+		{"inline_head", disk.LayoutFlatInline, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			img := image{
+				sb:      disk.SuperBlock{BlkSizeBits: 12},
+				meta:    bytes.NewReader(make([]byte, 8192)),
+				devices: []deviceInfo{{device: bytes.NewReader(payload), mappedBlkAddr: 2, blocks: 2}},
+			}
+			img.blkPool.New = func() any { return &block{buf: make([]byte, 4096)} }
+			ino := inode{inodeLayout: tc.layout, inodeData: 2, size: 8192}
+			blk, err := img.loadBlock(&ino, tc.pos)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer img.putBlock(blk)
+			if !bytes.Equal(blk.bytes(), payload[tc.pos:tc.pos+4096]) {
+				t.Fatal("flat extent read metadata instead of the mapped external device")
+			}
+		})
+	}
+}
 
 func TestChunkBitsFromChunks(t *testing.T) {
 	const blockSize = 4096
