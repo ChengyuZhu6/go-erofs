@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 
@@ -11,8 +12,9 @@ import (
 )
 
 // EncodedRange describes compressed bytes, never an uncompressed DataRange.
-// Device zero addresses metadata; nonzero devices follow the image device table.
-// Size is decoded length. EncodedSize is block-aligned stored length.
+// Device zero addresses the primary image; nonzero devices follow its device table.
+// Size is decoded length. EncodedSize is block-aligned stored length, and the
+// stored range must fit within the referenced device.
 // Partial permits the stored stream to decode beyond Size.
 type EncodedRange struct {
 	Device                    uint16
@@ -25,10 +27,16 @@ func WithCompression() CreateOpt {
 	return func(o *createOptions) { o.compress = true }
 }
 
+// WithHotFiles places the named regular files before cold data in a single
+// image or a compressed external data file without changing inode order.
+// Hot files in a single image are not inlined into metadata.
 func WithHotFiles(paths ...string) CreateOpt {
 	return func(o *createOptions) { o.hotFiles = append(o.hotFiles, paths...) }
 }
 
+// HotDataEnd is the exclusive byte offset of the block-aligned hot prefix after
+// Close, in the primary image or the external compression data file. It is zero
+// when no selected file has stored data.
 func (w *Writer) HotDataEnd() int64 { return w.hotDataEnd }
 
 func (fi *fileInfo) EncodedRanges() ([]EncodedRange, error) {
@@ -255,15 +263,16 @@ func (w *erofsWriter) writeCompressedIndexes(out io.Writer, e *erofsEntry) error
 		if logical+r.Size < int64(e.size) && logical/int64(w.blockSize) == (logical+r.Size)/int64(w.blockSize) {
 			return fmt.Errorf("multiple compressed heads in one cluster: %w", ErrNotImplemented)
 		}
+		if r.Offset > math.MaxInt64-r.EncodedSize {
+			return ErrInvalid
+		}
 		physical := uint64(r.Offset / int64(w.blockSize))
 		if r.Device != 0 {
-			physical += uint64(w.sbAreaBlocks() + (w.metadataBytes()+w.blockSize-1)/w.blockSize)
-			for _, entry := range w.entries {
-				physical += uint64((w.flatPlainDataSize(entry) + w.blockSize - 1) / w.blockSize)
+			blocks := w.devices[r.Device-1]
+			if physical >= blocks || uint64(r.EncodedSize/int64(w.blockSize)) > blocks-physical {
+				return ErrInvalid
 			}
-			for _, blocks := range w.devices[:r.Device-1] {
-				physical += blocks
-			}
+			physical += w.deviceBases[r.Device-1]
 		} else if e.data != nil {
 			physical += uint64(e.dataBlkAddr)
 		}

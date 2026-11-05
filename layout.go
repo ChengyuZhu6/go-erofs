@@ -12,8 +12,20 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	// DFS keeps directory contents close to their parent inode,
 	// improving locality for operations like find and ls -lR.
 	w.entries = nil
+	hot := make(map[string]bool, len(w.hotFiles))
+	for _, name := range w.hotFiles {
+		hot[cleanPath(name)] = true
+	}
+	w.hotEntries = make(map[*erofsEntry]bool)
 	var walk func(e *erofsEntry)
 	walk = func(e *erofsEntry) {
+		if hot[e.path] {
+			target := e
+			if e.hardlink != nil {
+				target = e.hardlink
+			}
+			w.hotEntries[target] = true
+		}
 		if e.hardlink != nil {
 			return
 		}
@@ -28,6 +40,13 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 		}
 	}
 	walk(root)
+	w.dataEntries = w.entries
+	if len(w.hotEntries) > 0 {
+		w.dataEntries = append([]*erofsEntry(nil), w.entries...)
+		sort.SliceStable(w.dataEntries, func(i, j int) bool {
+			return w.hotEntries[w.dataEntries[i]] && !w.hotEntries[w.dataEntries[j]]
+		})
+	}
 
 	w.totalInodes = uint64(len(w.entries))
 
@@ -68,6 +87,8 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 			case len(e.chunks) > 0 || e.metadataOnly:
 				e.layout = disk.LayoutChunkBased
 				e.chunkBits = w.chunkBitsFor(e)
+			case w.hotEntries[e]:
+				e.layout = disk.LayoutFlatPlain
 			default:
 				// Full-image mode: decide inline vs plain
 				if int(e.size) <= w.blockSize-headerSize {

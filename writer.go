@@ -27,12 +27,17 @@ type onlyWriter struct{ io.Writer }
 // erofsWriter serializes EROFS metadata to an io.Writer.
 type erofsWriter struct {
 	entries     []*erofsEntry // all entries in NID order
+	dataEntries []*erofsEntry // data order is independent of inode order
+	hotFiles    []string
+	hotEntries  map[*erofsEntry]bool
+	hotDataEnd  int64
 	rootNid     uint64
 	metaBlkAddr uint32
 	totalInodes uint64
 	buildTime   uint64
 	buildTimeNs uint32
 	devices     []uint64 // per-device block counts (one slot per entry)
+	deviceBases []uint64 // unified block addresses, computed after layout is final
 	blockSize   int
 	chunkBits   uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
 	copyBuf     []byte                       // reusable buffer for io.CopyBuffer
@@ -49,12 +54,9 @@ func inodeCoreSize(e *erofsEntry) int {
 }
 
 // entryChunkBits returns the chunk bits for a specific entry.
-// Per-inode chunkBits (from chunkBitsFor) overrides the writer default.
+// Zero is a valid per-inode value for one filesystem block per chunk.
 func (w *erofsWriter) entryChunkBits(e *erofsEntry) uint8 {
-	if e.chunkBits > 0 {
-		return e.chunkBits
-	}
-	return w.chunkBits
+	return e.chunkBits
 }
 
 // entryChunkSize returns the chunk size in bytes for a specific entry.
@@ -146,9 +148,8 @@ func chunkBitsFromChunks(chunks []builder.Chunk, size uint64, blockSize int, flo
 	if b > 31 {
 		b = 31
 	}
-	if b < floor {
-		return floor
-	}
+	// A hole or device boundary may require chunks smaller than the preferred
+	// floor. Linux derives chunkbits from filesystem block bits, not page bits.
 	return b
 }
 
@@ -166,6 +167,18 @@ func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
 	// Set metaBlkAddr to a sentinel so assignDataBlocks uses data-first.
 	w.metaBlkAddr = 0xFFFFFFFF
 	w.assignDataBlocks()
+
+	if len(w.devices) > 0 {
+		mapped := uint64(w.metaBlkAddr) + uint64((w.metadataBytes()+w.blockSize-1)/w.blockSize)
+		w.deviceBases = make([]uint64, len(w.devices))
+		for i, blocks := range w.devices {
+			if blocks > math.MaxUint32 || mapped > math.MaxUint32 {
+				return ErrInvalid
+			}
+			w.deviceBases[i] = mapped
+			mapped += blocks
+		}
+	}
 
 	// Write placeholder superblock area.
 	if _, err := out.Write(make([]byte, w.sbAreaSize())); err != nil {
@@ -234,19 +247,25 @@ func (w *erofsWriter) assignDataBlocks() {
 		}
 		metaBlocks := (totalMetaBytes + w.blockSize - 1) / w.blockSize
 		addr := uint32(w.sbAreaBlocks() + metaBlocks)
-		for _, e := range w.entries {
+		for _, e := range w.dataEntries {
 			if ds := w.flatPlainDataSize(e); ds > 0 {
 				e.dataBlkAddr = addr
 				addr += uint32((ds + w.blockSize - 1) / w.blockSize)
+				if w.hotEntries[e] {
+					w.hotDataEnd = int64(addr) * int64(w.blockSize)
+				}
 			}
 		}
 	} else {
 		// Data-first: data starts after superblock area.
 		addr := uint32(w.sbAreaBlocks())
-		for _, e := range w.entries {
+		for _, e := range w.dataEntries {
 			if ds := w.flatPlainDataSize(e); ds > 0 {
 				e.dataBlkAddr = addr
 				addr += uint32((ds + w.blockSize - 1) / w.blockSize)
+				if w.hotEntries[e] {
+					w.hotDataEnd = int64(addr) * int64(w.blockSize)
+				}
 			}
 		}
 		w.metaBlkAddr = addr // metadata follows data
@@ -318,6 +337,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		extraDevices = uint16(len(w.devices))
 		devtSlotOff = uint16((disk.SuperBlockOffset + disk.SizeSuperBlock) / disk.SizeDeviceSlot)
 	}
+	maxLZ4Blocks := int64(1)
 	for _, e := range w.entries {
 		if len(e.chunks) > 0 {
 			featureIncompat |= disk.FeatureIncompatChunkedFile
@@ -325,6 +345,16 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		if len(e.encodedRanges) > 0 {
 			featureIncompat |= disk.FeatureIncompatLZ4_0Padding | 2
 		}
+		for _, r := range e.encodedRanges {
+			if r.Algorithm == 0 {
+				maxLZ4Blocks = max(maxLZ4Blocks, r.EncodedSize/int64(w.blockSize))
+			}
+		}
+	}
+	// Linux parses LZ4 configuration before installing the on-disk block size.
+	// Its initial 4KiB page size imposes a 256-block maximum even for 512B images.
+	if maxLZ4Blocks > maxCompressedBytes/4096 {
+		return fmt.Errorf("LZ4 pcluster exceeds 4KiB-page kernel limit: %w", ErrNotImplemented)
 	}
 
 	var algorithms uint16
@@ -358,7 +388,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		config := sbArea[disk.SuperBlockOffset+disk.SizeSuperBlock:]
 		binary.LittleEndian.PutUint16(config[:2], 14)
 		binary.LittleEndian.PutUint16(config[2:4], 65535)
-		binary.LittleEndian.PutUint16(config[4:6], uint16(maxCompressedBytes/w.blockSize))
+		binary.LittleEndian.PutUint16(config[4:6], uint16(maxLZ4Blocks))
 	}
 	var mapped uint64 = uint64(totalBlocks)
 	// Write device slots after the compression configuration.
@@ -745,7 +775,7 @@ func (w *erofsWriter) writeDirents(buf io.Writer, e *erofsEntry) (int, error) {
 
 // writeDataBlocks writes data blocks for flat-plain entries directly to out.
 func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
-	for _, e := range w.entries {
+	for _, e := range w.dataEntries {
 		ds := w.flatPlainDataSize(e)
 		if ds == 0 {
 			continue
