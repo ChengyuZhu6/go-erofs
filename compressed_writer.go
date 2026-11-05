@@ -292,9 +292,13 @@ func (w *erofsWriter) writeCompressedIndexes(out io.Writer, e *erofsEntry) error
 		}
 		for index := first + 1; index <= last; index++ {
 			binary.LittleEndian.PutUint16(indexes[16+index*8:], 2)
-			back := index - first
+			back := min(index-first, compressedBlockCount-1)
 			if index == first+1 {
-				back = compressedBlockCount + r.EncodedSize/int64(w.blockSize)
+				blocks := r.EncodedSize / int64(w.blockSize)
+				if blocks >= compressedBlockCount {
+					return ErrInvalid
+				}
+				back = compressedBlockCount | blocks
 			}
 			if back > 65535 || last-index+1 > 65535 {
 				return ErrInvalid

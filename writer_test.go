@@ -309,6 +309,37 @@ func TestFileReadAtMappedDeviceBoundary(t *testing.T) {
 	}
 }
 
+func TestCompressedIndexLookbackBoundaries(t *testing.T) {
+	w := &erofsWriter{blockSize: 512}
+	for _, count := range []int64{2047, 2048, 6146} {
+		e := &erofsEntry{size: uint64(count * 512), layout: disk.LayoutCompressedFull, encodedRanges: []EncodedRange{{Size: count * 512, EncodedSize: 512}}}
+		var table bytes.Buffer
+		if err := w.writeCompressedIndexes(&table, e); err != nil {
+			t.Fatal(err)
+		}
+		for i := int64(2); i < count; i++ {
+			back := binary.LittleEndian.Uint16(table.Bytes()[20+i*8:])
+			if back != uint16(min(i, compressedBlockCount-1)) {
+				t.Fatalf("lookback at %d = %d", i, back)
+			}
+		}
+		f := &file{img: &image{meta: bytes.NewReader(table.Bytes()), sb: disk.SuperBlock{BlkSizeBits: 9}}}
+		ino := &inode{size: count * 512, inodeLayout: disk.LayoutCompressedFull}
+		c := &compressedFile{bits: 9, advise: 6}
+		if _, head, err := f.compressedHead(ino, c, ino.size-1); err != nil || head != 0 {
+			t.Fatalf("long lookback count=%d head=%d err=%v", count, head, err)
+		}
+	}
+	for _, blocks := range []int64{compressedBlockCount - 1, compressedBlockCount} {
+		e := &erofsEntry{size: 1024, layout: disk.LayoutCompressedFull, encodedRanges: []EncodedRange{{Size: 1024, EncodedSize: blocks * 512}}}
+		var table bytes.Buffer
+		err := w.writeCompressedIndexes(&table, e)
+		if (blocks < compressedBlockCount) != (err == nil) {
+			t.Fatalf("compressed block count=%d err=%v", blocks, err)
+		}
+	}
+}
+
 func TestLZ4CodecAndMalformedBlocks(t *testing.T) {
 	for _, size := range []int{0, 5, 12, 255, 4096, 65536} {
 		data := bytes.Repeat([]byte("abcde"), (size+4)/5)[:size]
