@@ -340,6 +340,39 @@ func (img *image) mapDev(deviceID uint16, pa int64) (io.ReaderAt, int64, error) 
 	return img.meta, pa, nil
 }
 
+func (img *image) mapDataRanges(ranges []DataRange) []DataRange {
+	var mapped []DataRange
+	for _, r := range ranges {
+		if r.Device != 0 || r.Offset == holeOffset {
+			mapped = append(mapped, r)
+			continue
+		}
+		for r.Size > 0 {
+			part := r
+			for i, dev := range img.devices {
+				if dev.mappedBlkAddr == 0 {
+					continue
+				}
+				start := int64(dev.mappedBlkAddr) << img.sb.BlkSizeBits
+				end := start + int64(dev.blocks)<<img.sb.BlkSizeBits
+				if r.Offset >= start && r.Offset < end {
+					part.Device = uint16(i + 1)
+					part.Offset -= start
+					part.Size = min(part.Size, end-r.Offset)
+					break
+				}
+				if r.Offset < start {
+					part.Size = min(part.Size, start-r.Offset)
+				}
+			}
+			mapped = append(mapped, part)
+			r.Offset += part.Size
+			r.Size -= part.Size
+		}
+	}
+	return mapped
+}
+
 // blockSize returns the filesystem block size.
 func (img *image) blockSize() uint32 { return 1 << img.sb.BlkSizeBits }
 
@@ -360,20 +393,17 @@ func (img *image) deviceBlocks() []uint64 {
 	return blocks
 }
 
-// openDirect returns an io.Reader for a file's data that reads directly
-// from the underlying metadata reader, bypassing the block-at-a-time
-// Read path. Returns nil if direct reading is not possible (e.g.
-// chunk-based or compressed files).
+// openDirect bypasses block-at-a-time reads only when the complete file
+// occupies one contiguous span on a single underlying device.
 func (img *image) openDirect(ino *inode) io.Reader {
 	if ino.size <= 0 {
 		return nil
 	}
 	blockSize := int64(1 << img.sb.BlkSizeBits)
+	r := DataRange{Size: ino.size}
 	switch ino.inodeLayout {
 	case disk.LayoutFlatPlain:
-		// Data is contiguous starting at dataBlkAddr.
-		dataOffset := int64(ino.inodeData) << img.sb.BlkSizeBits
-		return io.NewSectionReader(img.meta, dataOffset, ino.size)
+		r.Offset = int64(ino.inodeData) << img.sb.BlkSizeBits
 	case disk.LayoutFlatInline:
 		// Last block is inline after the inode; earlier blocks at dataBlkAddr.
 		// Only use direct read for single-block files (all data inline).
@@ -434,15 +464,24 @@ func (img *image) openDirect(ino *inode) io.Reader {
 			}
 		}
 
-		// All chunks contiguous — resolve through the device.
-		dataOffset := int64(startBlock) << img.sb.BlkSizeBits
-		if deviceID > 0 && int(deviceID) <= len(img.devices) {
-			return io.NewSectionReader(img.devices[deviceID-1].device, dataOffset, ino.size)
-		}
-		return io.NewSectionReader(img.meta, dataOffset, ino.size)
+		r.Device = deviceID
+		r.Offset = int64(startBlock) << img.sb.BlkSizeBits
 	default:
 		return nil
 	}
+	ranges := img.mapDataRanges([]DataRange{r})
+	if len(ranges) != 1 {
+		return nil
+	}
+	r = ranges[0]
+	device := img.meta
+	if r.Device > 0 {
+		if int(r.Device) > len(img.devices) {
+			return nil
+		}
+		device = img.devices[r.Device-1].device
+	}
+	return io.NewSectionReader(device, r.Offset, r.Size)
 }
 
 func (img *image) readMetadata(r io.Reader) ([]byte, error) {
@@ -733,9 +772,13 @@ func (img *image) loadBlock(fi *inode, pos int64) (*block, error) {
 		return nil, fmt.Errorf("invalid block bounds [%d:%d] for nid %d: %w", blockOffset, blockEnd, fi.nid, ErrInvalid)
 	}
 
-	reader, mappedAddr, err := img.mapDev(0, addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to map device for nid %d: %w", fi.nid, err)
+	reader, mappedAddr := img.meta, addr
+	if fi.inodeLayout != disk.LayoutFlatInline || bn != nblocks-1 {
+		var err error
+		reader, mappedAddr, err = img.mapDev(0, addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to map device for nid %d: %w", fi.nid, err)
+		}
 	}
 	b := img.getBlock()
 	b.offset = int32(blockOffset)
@@ -930,12 +973,11 @@ func (i *image) ReadFile(name string) ([]byte, error) {
 		return nil, fmt.Errorf("file size %d exceeds ReadFile limit %d; use Open and io.Copy for large files: %w", fi.size, int64(maxReadFileSize), ErrInvalid)
 	}
 	buf := make([]byte, fi.size)
-	if fi.size > 0 {
-		if _, err = f.Read(buf); err != nil && err != io.EOF {
-			return nil, err
-		}
+	n, err := io.ReadFull(f, buf)
+	if err == io.EOF && fi.size > 0 {
+		err = io.ErrUnexpectedEOF
 	}
-	return buf, nil
+	return buf[:n], err
 }
 
 func (i *image) ReadDir(name string) ([]fs.DirEntry, error) {
@@ -1165,7 +1207,7 @@ func (b *file) buildDataRanges(ino *inode) []DataRange {
 	switch ino.inodeLayout {
 	case disk.LayoutFlatPlain:
 		dataOffset := int64(ino.inodeData) << b.img.sb.BlkSizeBits
-		return []DataRange{{Device: 0, Offset: dataOffset, Size: ino.size}}
+		return b.img.mapDataRanges([]DataRange{{Device: 0, Offset: dataOffset, Size: ino.size}})
 	case disk.LayoutFlatInline:
 		inodeAddr := b.img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact
 		trailingAddr := inodeAddr + ino.flatDataOffset()
@@ -1180,7 +1222,7 @@ func (b *file) buildDataRanges(ino *inode) []DataRange {
 		var ranges []DataRange
 		if headSize > 0 {
 			dataOffset := int64(ino.inodeData) << b.img.sb.BlkSizeBits
-			ranges = append(ranges, DataRange{Device: 0, Offset: dataOffset, Size: headSize})
+			ranges = b.img.mapDataRanges([]DataRange{{Device: 0, Offset: dataOffset, Size: headSize}})
 		}
 		ranges = append(ranges, DataRange{Device: 0, Offset: trailingAddr, Size: tailSize})
 		return ranges
@@ -1276,7 +1318,7 @@ func (b *file) buildChunkDataRanges(ino *inode) ([]DataRange, error) {
 		}
 		ranges = append(ranges, DataRange{Device: deviceID, Offset: byteOffset, Size: size})
 	}
-	return ranges, nil
+	return b.img.mapDataRanges(ranges), nil
 }
 
 func (b *file) prepareReadAt() error {
@@ -1335,32 +1377,7 @@ func (b *file) prepareReadAt() error {
 				return
 			}
 			size += r.Size
-			if r.Device != 0 || r.Offset == holeOffset {
-				b.readAtRanges = append(b.readAtRanges, r)
-				continue
-			}
-			for r.Size > 0 {
-				part := r
-				for i, dev := range b.img.devices {
-					if dev.mappedBlkAddr == 0 {
-						continue
-					}
-					start := int64(dev.mappedBlkAddr) << b.img.sb.BlkSizeBits
-					end := start + int64(dev.blocks)<<b.img.sb.BlkSizeBits
-					if r.Offset >= start && r.Offset < end {
-						part.Device = uint16(i + 1)
-						part.Offset -= start
-						part.Size = min(part.Size, end-r.Offset)
-						break
-					}
-					if r.Offset < start {
-						part.Size = min(part.Size, start-r.Offset)
-					}
-				}
-				b.readAtRanges = append(b.readAtRanges, part)
-				r.Offset += part.Size
-				r.Size -= part.Size
-			}
+			b.readAtRanges = append(b.readAtRanges, r)
 		}
 		if size != ino.size {
 			b.readAtErr = fmt.Errorf("file data range coverage %d differs from size %d: %w", size, ino.size, ErrInvalid)
@@ -1459,15 +1476,18 @@ func (b *file) ReadAt(p []byte, off int64) (int, error) {
 		if r.Offset == holeOffset {
 			clear(part)
 		} else {
-			device, at, err := b.img.mapDev(r.Device, r.Offset+within)
-			if err != nil {
-				return total, err
+			device := b.img.meta
+			if r.Device > 0 {
+				device = b.img.devices[r.Device-1].device
 			}
-			n, err := device.ReadAt(part, at)
-			if n != len(part) || err != nil {
+			n, err := device.ReadAt(part, r.Offset+within)
+			if n != len(part) {
 				if err == nil {
 					err = io.ErrUnexpectedEOF
 				}
+				return total + n, err
+			}
+			if err != nil && err != io.EOF {
 				return total + n, err
 			}
 		}

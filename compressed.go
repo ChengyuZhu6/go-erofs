@@ -459,10 +459,13 @@ func (b *file) compressedReadAt(p []byte, off int64) (int, error) {
 				device, at = b.img.meta, m.physical
 			}
 			n, e := device.ReadAt(encoded, at)
-			if e != nil || n != len(encoded) {
-				if e == nil {
+			if n != len(encoded) {
+				if e == nil || e == io.EOF {
 					e = io.ErrUnexpectedEOF
 				}
+				return total, e
+			}
+			if e != nil && e != io.EOF {
 				return total, e
 			}
 			switch m.algorithm {

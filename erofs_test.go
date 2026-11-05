@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/erofs/go-erofs"
+	"github.com/erofs/go-erofs/internal/disk"
 	"github.com/erofs/go-erofs/internal/erofstest"
 )
 
@@ -751,5 +752,240 @@ func TestDataRangeSparseChunkBased(t *testing.T) {
 
 	if !foundHole {
 		t.Error("no hole entries found in fixture — buildChunkDataRanges hole path was not exercised")
+	}
+}
+
+type eofPayloadReader struct {
+	io.ReaderAt
+}
+
+func (r eofPayloadReader) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.ReaderAt.ReadAt(p, off)
+	if err == nil {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func TestCompressedReadFilePayloadEOF(t *testing.T) {
+	var meta testBuffer
+	blob, err := os.Create(filepath.Join(t.TempDir(), "blob.erofs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blob.Close() })
+	content := bytes.Repeat([]byte("compressed payload"), 1024)
+	writer := erofs.Create(&meta, erofs.WithCompression(), erofs.WithDataFile(blob))
+	if err := writer.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+		{Path: "/file", Mode: 0644, Size: int64(len(content)), Data: bytes.NewReader(content)},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		data io.ReaderAt
+		want []byte
+		err  error
+	}{
+		{"short", io.NewSectionReader(blob, 0, 4095), nil, io.ErrUnexpectedEOF},
+		{"full", eofPayloadReader{blob}, content, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			image, err := erofs.Open(bytes.NewReader(meta.Bytes()), erofs.WithExtraDevices(tc.data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := fs.ReadFile(image, "file")
+			if !errors.Is(err, tc.err) || !bytes.Equal(got, tc.want) {
+				t.Fatalf("ReadFile bytes=%d err=%v, want bytes=%d err=%v", len(got), err, len(tc.want), tc.err)
+			}
+		})
+	}
+}
+
+func mappedReadFixture(t *testing.T, layout uint8, size int, mapped uint32) []byte {
+	t.Helper()
+	meta := make([]byte, 5*4096)
+	encode := func(off int, value any) {
+		t.Helper()
+		if _, err := binary.Encode(meta[off:], binary.LittleEndian, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encode(1024, disk.SuperBlock{
+		MagicNumber: disk.MagicNumber, BlkSizeBits: 12, Inos: 2, Blocks: 5,
+		MetaBlkAddr: 1, FeatureIncompat: disk.FeatureIncompatDeviceTable | disk.FeatureIncompatChunkedFile,
+		ExtraDevices: 1, DevtSlotOff: 16,
+	})
+	encode(2048, disk.DeviceSlot{Blocks: 1, MappedBlkAddr: mapped})
+	encode(4096, disk.InodeCompact{Format: disk.LayoutFlatInline << 1, Mode: 0040755, Nlink: 2, Size: 43})
+	encode(4128, disk.Dirent{Nid: 0, NameOff: 36, FileType: 2})
+	encode(4140, disk.Dirent{Nid: 0, NameOff: 37, FileType: 2})
+	encode(4152, disk.Dirent{Nid: 4, NameOff: 39, FileType: 1})
+	copy(meta[4164:], "...file")
+	inodeData := uint32(3)
+	if layout == disk.LayoutChunkBased {
+		inodeData = disk.LayoutChunkFormatIndexes
+	}
+	encode(4224, disk.InodeCompact{Format: uint16(layout) << 1, Mode: 0100644, Nlink: 1, Size: uint32(size), InodeData: inodeData})
+	if layout == disk.LayoutChunkBased {
+		for i := 0; i*4096 < size; i++ {
+			encode(4256+i*8, disk.InodeChunkIndex{StartBlkLo: uint32(3 + i)})
+		}
+	}
+	copy(meta[3*4096:], bytes.Repeat([]byte("M"), 2*4096))
+	return meta
+}
+
+func TestReadAtRangePayloadEOF(t *testing.T) {
+	meta := mappedReadFixture(t, disk.LayoutFlatPlain, 8192, 3)
+	payload := bytes.Repeat([]byte("E"), 4096)
+	want := append(bytes.Clone(payload), bytes.Repeat([]byte("M"), 4096)...)
+	image, err := erofs.Open(bytes.NewReader(meta), erofs.WithExtraDevices(eofPayloadReader{bytes.NewReader(payload)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := image.Open("file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got := make([]byte, len(want))
+	n, err := file.(io.ReaderAt).ReadAt(got, 0)
+	if n != len(want) || err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("ReadAt n=%d err=%v, want %d complete bytes", n, err, len(want))
+	}
+}
+
+func TestCopyFromUnifiedDeviceMapping(t *testing.T) {
+	for _, layout := range []uint8{disk.LayoutFlatPlain, disk.LayoutChunkBased} {
+		for _, size := range []int{4096, 8192} {
+			t.Run(fmt.Sprintf("layout-%d/size-%d", layout, size), func(t *testing.T) {
+				meta := mappedReadFixture(t, layout, size, 3)
+				payload := bytes.Repeat([]byte("E"), 4096)
+				want := bytes.Clone(payload)
+				if size > len(want) {
+					want = append(want, bytes.Repeat([]byte("M"), size-len(want))...)
+				}
+				image, err := erofs.Open(bytes.NewReader(meta), erofs.WithExtraDevices(bytes.NewReader(payload)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := fs.ReadFile(image, "file"); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("source ReadFile bytes=%d err=%v", len(got), err)
+				}
+				var copied testBuffer
+				writer := erofs.Create(&copied)
+				if err := writer.CopyFrom(image); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+				result, err := erofs.Open(bytes.NewReader(copied.Bytes()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := fs.ReadFile(result, "file"); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("copied ReadFile bytes=%d err=%v, want mapped device payload", len(got), err)
+				}
+			})
+		}
+	}
+}
+
+func TestDataRangeUnifiedDeviceMapping(t *testing.T) {
+	for _, layout := range []uint8{disk.LayoutFlatPlain, disk.LayoutChunkBased} {
+		t.Run(fmt.Sprintf("layout-%d", layout), func(t *testing.T) {
+			size := 8192
+			if layout == disk.LayoutChunkBased {
+				size += 8192
+			}
+			meta := mappedReadFixture(t, layout, size, 3)
+			if layout == disk.LayoutChunkBased {
+				binary.LittleEndian.PutUint16(meta[4274:4276], 1)
+				binary.LittleEndian.PutUint32(meta[4276:4280], 0)
+				binary.LittleEndian.PutUint32(meta[4284:4288], ^uint32(0))
+			}
+			payload := bytes.Repeat([]byte("E"), 4096)
+			want := append(bytes.Clone(payload), bytes.Repeat([]byte("M"), 4096)...)
+			if layout == disk.LayoutChunkBased {
+				want = append(want, payload...)
+			}
+			want = append(want, make([]byte, size-len(want))...)
+			devices := []io.ReaderAt{bytes.NewReader(meta), bytes.NewReader(payload)}
+			image, err := erofs.Open(devices[0], erofs.WithExtraDevices(devices[1]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := fs.Stat(image, "file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []byte
+			for _, r := range info.(dataRanger).DataRange() {
+				part := make([]byte, r.Size)
+				if r.Offset >= 0 {
+					if int(r.Device) >= len(devices) {
+						t.Fatalf("invalid DataRange device %d", r.Device)
+					}
+					if n, err := devices[r.Device].ReadAt(part, r.Offset); n != len(part) || err != nil {
+						t.Fatalf("DataRange payload n=%d err=%v", n, err)
+					}
+				}
+				got = append(got, part...)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("DataRange reconstructed %d bytes, want external payload, metadata and holes", len(got))
+			}
+		})
+	}
+}
+
+func TestInlineMetadataDeviceMapping(t *testing.T) {
+	for _, mapped := range []uint32{1, 3} {
+		t.Run(fmt.Sprintf("window-%d", mapped), func(t *testing.T) {
+			tail := []byte("inline metadata")
+			meta := mappedReadFixture(t, disk.LayoutFlatInline, 4096+len(tail), mapped)
+			copy(meta[4256:], tail)
+			payload := bytes.Repeat([]byte("E"), 4096)
+			want := bytes.Repeat([]byte("M"), 4096)
+			if mapped == 3 {
+				want = bytes.Clone(payload)
+			}
+			want = append(want, tail...)
+			devices := []io.ReaderAt{bytes.NewReader(meta), bytes.NewReader(payload)}
+			image, err := erofs.Open(devices[0], erofs.WithExtraDevices(devices[1]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, err := image.Open("file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			got := make([]byte, len(want))
+			if n, err := file.(io.ReaderAt).ReadAt(got, 0); n != len(want) || err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("inline ReadAt n=%d err=%v, must read tail from metadata", n, err)
+			}
+			info, err := file.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var reconstructed []byte
+			for _, r := range info.(dataRanger).DataRange() {
+				part := make([]byte, r.Size)
+				if n, err := devices[r.Device].ReadAt(part, r.Offset); n != len(part) || err != nil {
+					t.Fatalf("inline DataRange n=%d err=%v", n, err)
+				}
+				reconstructed = append(reconstructed, part...)
+			}
+			if !bytes.Equal(reconstructed, want) {
+				t.Fatal("inline DataRange reconstructed incorrect head or metadata tail")
+			}
+		})
 	}
 }
