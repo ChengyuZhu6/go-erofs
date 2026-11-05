@@ -309,6 +309,34 @@ func TestFileReadAtMappedDeviceBoundary(t *testing.T) {
 	}
 }
 
+func TestLZ4CodecAndMalformedBlocks(t *testing.T) {
+	for _, size := range []int{0, 5, 12, 255, 4096, 65536} {
+		data := bytes.Repeat([]byte("abcde"), (size+4)/5)[:size]
+		encoded := compressLZ4(data)
+		decoded := make([]byte, size)
+		if n, err := decodeLZ4(encoded, decoded, false); err != nil || n != size || !bytes.Equal(decoded, data) {
+			t.Fatalf("LZ4 roundtrip size=%d n=%d err=%v", size, n, err)
+		}
+		if size > 0 {
+			prefix := make([]byte, min(size, 11))
+			if n, err := decodeLZ4(encoded, prefix, true); err != nil || n != len(prefix) || !bytes.Equal(prefix, data[:len(prefix)]) {
+				t.Fatalf("LZ4 prefix size=%d n=%d err=%v", size, n, err)
+			}
+			if _, err := decodeLZ4(append(encoded, 0), decoded, false); err == nil {
+				t.Fatal("complete LZ4 accepted trailing input")
+			}
+			if _, err := decodeLZ4(encoded[:len(encoded)-1], decoded, false); err == nil {
+				t.Fatal("complete LZ4 accepted truncated input")
+			}
+		}
+	}
+	for _, encoded := range [][]byte{{0x10, 'a', 0, 0}, {0x10, 'a', 2, 0}, {0xf0, 255}} {
+		if _, err := decodeLZ4(encoded, make([]byte, 16), false); err == nil {
+			t.Fatalf("malformed LZ4 accepted: %x", encoded)
+		}
+	}
+}
+
 func TestFileReadAtRejectsInvalidMapping(t *testing.T) {
 	for _, format := range []uint16{0, disk.LayoutChunkFormatIndexes, disk.LayoutChunkFormat48Bit, 0x8000} {
 		for _, truncated := range []bool{false, true} {

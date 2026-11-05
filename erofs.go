@@ -249,9 +249,9 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 
 	// LZ4_0Padding is a format compatibility bit. It does not imply that this
 	// image contains compressed inodes; ComprAlgs does.
-	if i.sb.ComprAlgs != 0 && !o.allowCompressedMetadata {
-		return nil, fmt.Errorf("unsupported compressed filesystem (FeatureIncompat=0x%x, ComprAlgs=0x%x): %w",
-			i.sb.FeatureIncompat, i.sb.ComprAlgs, ErrNotImplemented)
+	i.metadataOnly = o.allowCompressedMetadata
+	if i.sb.FeatureIncompat&2 != 0 && i.sb.ComprAlgs&^uint16(1|4) != 0 && !o.allowCompressedMetadata {
+		return nil, fmt.Errorf("unsupported compression algorithms 0x%x: %w", i.sb.ComprAlgs, ErrNotImplemented)
 	}
 
 	i.blkPool.New = func() any {
@@ -297,6 +297,7 @@ type image struct {
 	longPrefixes []string // cached long xattr prefixes
 	prefixesOnce sync.Once
 	prefixesErr  error
+	metadataOnly bool
 }
 
 // start physical offset of the separate metadata zone
@@ -924,9 +925,7 @@ func (i *image) ReadFile(name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if fi.inodeLayout == disk.LayoutCompressedFull || fi.inodeLayout == disk.LayoutCompressedCompact {
-		return nil, fmt.Errorf("compressed inode layout %d: %w", fi.inodeLayout, ErrNotImplemented)
-	}
+	defer f.Close()
 	if fi.size < 0 || fi.size > maxReadFileSize {
 		return nil, fmt.Errorf("file size %d exceeds ReadFile limit %d; use Open and io.Copy for large files: %w", fi.size, int64(maxReadFileSize), ErrInvalid)
 	}
@@ -993,6 +992,7 @@ type file struct {
 	readAtRanges []DataRange
 	readAtStarts []int64
 	readAtErr    error
+	compressed   *compressedFile
 }
 
 func (b *file) readInfo() (ino *inode, err error) {
@@ -1124,6 +1124,12 @@ func (b *file) statInfo() (*fileInfo, error) {
 		if err := loadXattrs(b, fi.stat); err != nil {
 			return nil, err
 		}
+	}
+	if ino.mode.IsRegular() && ino.size > 0 && (ino.inodeLayout == disk.LayoutCompressedFull || ino.inodeLayout == disk.LayoutCompressedCompact) {
+		copy := *ino
+		copy.cached = nil
+		img := b.img
+		fi.encodedLoader = func() ([]EncodedRange, error) { return (&file{img: img}).encodedRanges(&copy) }
 	}
 	// Build data ranges for regular files.
 	// Flat layouts are cheap (no I/O) — compute eagerly.
@@ -1291,7 +1297,11 @@ func (b *file) prepareReadAt() error {
 			return
 		}
 		if ino.inodeLayout == disk.LayoutCompressedFull || ino.inodeLayout == disk.LayoutCompressedCompact {
-			b.readAtErr = ErrNotImplemented
+			if b.img.metadataOnly {
+				b.readAtErr = ErrNotImplemented
+			} else if b.compressed == nil {
+				b.compressed, b.readAtErr = b.compressionInfo(ino)
+			}
 			return
 		}
 		if ino.size < 0 {
@@ -1377,6 +1387,36 @@ func (b *file) ValidateData(deviceSizes []int64) error {
 	if b.closed {
 		return fs.ErrClosed
 	}
+	if b.compressed != nil {
+		for at := int64(0); at < b.info.size; {
+			m, err := b.compressedMap(b.info, b.compressed, at)
+			if err != nil {
+				return err
+			}
+			if m.algorithm == 255 {
+				return fmt.Errorf("fragment validation requires packed inode: %w", ErrNotImplemented)
+			}
+			device, offset := 0, m.physical
+			if !m.inline {
+				for i, d := range b.img.devices {
+					start := int64(d.mappedBlkAddr) << b.img.sb.BlkSizeBits
+					end := start + int64(d.blocks)<<b.img.sb.BlkSizeBits
+					if d.mappedBlkAddr != 0 && offset >= start && offset < end {
+						if m.encoded > end-offset {
+							return ErrInvalid
+						}
+						device, offset = i+1, offset-start
+						break
+					}
+				}
+			}
+			if device >= len(deviceSizes) || offset > deviceSizes[device] || m.encoded > deviceSizes[device]-offset {
+				return ErrInvalid
+			}
+			at = m.logical + m.length
+		}
+		return nil
+	}
 	for _, r := range b.readAtRanges {
 		if r.Offset == holeOffset {
 			continue
@@ -1401,6 +1441,9 @@ func (b *file) ReadAt(p []byte, off int64) (int, error) {
 	defer b.mu.RUnlock()
 	if b.closed {
 		return 0, fs.ErrClosed
+	}
+	if b.compressed != nil {
+		return b.compressedReadAt(p, off)
 	}
 	var total int
 	for len(p) > 0 {
@@ -1455,7 +1498,15 @@ func (b *file) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	if fi.inodeLayout == disk.LayoutCompressedFull || fi.inodeLayout == disk.LayoutCompressedCompact {
-		return 0, fmt.Errorf("compressed inode layout %d: %w", fi.inodeLayout, ErrNotImplemented)
+		if b.compressed == nil {
+			b.compressed, err = b.compressionInfo(fi)
+			if err != nil {
+				return 0, err
+			}
+		}
+		n, err := b.compressedReadAt(p, b.offset)
+		b.offset += int64(n)
+		return n, err
 	}
 
 	var n int
@@ -1862,8 +1913,9 @@ type fileInfo struct {
 	// to parse the chunk index, so it is deferred until the caller actually
 	// calls DataRange(). For flat layouts (FlatPlain, FlatInline), ranges
 	// are computed eagerly at stat time since they require no I/O.
-	rangesOnce   sync.Once
-	rangesLoader func() []DataRange
+	rangesOnce    sync.Once
+	rangesLoader  func() []DataRange
+	encodedLoader func() ([]EncodedRange, error)
 }
 
 func (fi *fileInfo) Name() string       { return fi.name }

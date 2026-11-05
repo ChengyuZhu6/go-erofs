@@ -10,48 +10,17 @@ import (
 	"github.com/erofs/go-erofs/internal/disk"
 )
 
-// newMetaReader returns an at() function backed by an eagerly-read
-// metadata buffer plus an on-demand block cache for data blocks
-// outside the metadata region.
-func newMetaReader(ra io.ReaderAt, metaStart, totalBytes int64, blockSize int) func(int64) []byte {
-	metaSize := totalBytes - metaStart
-	if metaSize <= 0 {
-		return func(int64) []byte { return nil }
-	}
-	metaBuf := make([]byte, metaSize)
-	if n, err := ra.ReadAt(metaBuf, metaStart); err != nil || int64(n) != metaSize {
-		return func(int64) []byte { return nil }
-	}
-
-	cache := make(map[int64][]byte)
-
-	return func(off int64) []byte {
-		// Fast path: offset in metadata region.
-		if off >= metaStart {
-			o := off - metaStart
-			if o >= int64(len(metaBuf)) {
-				return nil
-			}
-			return metaBuf[o:]
-		}
-		// Outside metadata — flat-plain data block. Load on demand.
-		if off < 0 || off >= totalBytes {
+// Metadata-first images may have payload after metadata; read only requested spans.
+func newMetaReader(ra io.ReaderAt, totalBytes int64) func(int64, int) []byte {
+	return func(off int64, size int) []byte {
+		if off < 0 || size < 0 || off > totalBytes || int64(size) > totalBytes-off || size > maxChunkIndexBytes {
 			return nil
 		}
-		blkAddr := off - off%int64(blockSize)
-		if cached, ok := cache[blkAddr]; ok {
-			return cached[off-blkAddr:]
-		}
-		sz := int64(blockSize)
-		if blkAddr+sz > totalBytes {
-			sz = totalBytes - blkAddr
-		}
-		buf := make([]byte, sz)
-		if n, err := ra.ReadAt(buf, blkAddr); err != nil || int64(n) != sz {
+		buf := make([]byte, size)
+		if n, err := ra.ReadAt(buf, off); err != nil || n != size {
 			return nil
 		}
-		cache[blkAddr] = buf
-		return buf[off-blkAddr:]
+		return buf
 	}
 }
 
@@ -62,10 +31,7 @@ type imgQEntry struct {
 }
 
 // copyFromImage is a fast path for CopyFrom when the source is an *image.
-// Instead of walking via the fs.FS interface (which does per-inode ReadAt
-// syscalls), it reads the entire metadata area into memory and parses
-// inodes, directory entries, xattrs, and chunk indexes directly from the
-// buffer. This reduces thousands of syscalls to a single ReadAt.
+// Parse inode metadata directly while keeping external file payloads untouched.
 func (fsys *Writer) copyFromImage(img *image) error {
 	metaStart := img.metaStartPos()
 	totalBytes := int64(img.sb.Blocks) << img.sb.BlkSizeBits
@@ -77,11 +43,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 	buildTime := img.sb.BuildTime
 	buildTimeNs := img.sb.BuildTimeNs
 
-	blockSize := int(1 << blkBits)
-
-	// Get an accessor for image data. Reads the metadata region eagerly
-	// and loads flat-plain data blocks on demand.
-	at := newMetaReader(img.meta, metaStart, totalBytes, blockSize)
+	at := newMetaReader(img.meta, totalBytes)
 
 	// Shared xattr block address (if present). The at() function
 	// will load the block on demand when xattrs are parsed.
@@ -103,7 +65,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 		queue = queue[1:]
 
 		inodeAddr := metaStart + int64(cur.nid*disk.SizeInodeCompact)
-		buf := at(inodeAddr)
+		buf := at(inodeAddr, disk.SizeInodeCompact)
 		if len(buf) < disk.SizeInodeCompact {
 			return fmt.Errorf("inode %d out of range", cur.nid)
 		}
@@ -114,6 +76,9 @@ func (fsys *Writer) copyFromImage(img *image) error {
 
 		if compact && len(buf) < disk.SizeInodeCompact {
 			return fmt.Errorf("compact inode %d out of range", cur.nid)
+		}
+		if !compact {
+			buf = at(inodeAddr, disk.SizeInodeExtended)
 		}
 		if !compact && len(buf) < disk.SizeInodeExtended {
 			return fmt.Errorf("extended inode %d out of range", cur.nid)
@@ -172,7 +137,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 		var xattrs map[string]string
 		if xattrSize > 0 {
 			xattrAddr := inodeAddr + int64(icSize)
-			xb := at(xattrAddr)
+			xb := at(xattrAddr, xattrSize)
 			if len(xb) >= xattrSize {
 				xattrs = parseXattrsFromBuf(xb[:xattrSize], at, sharedXattrOff, img.getLongPrefix)
 			}
@@ -245,7 +210,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 						return fmt.Errorf("read symlink data for nid %d: %w", cur.nid, err)
 					}
 				} else {
-					linkData = at(trailingAddr)
+					linkData = at(trailingAddr, int(size))
 				}
 				if linkData != nil && int(size) <= len(linkData) {
 					fe.linkTarget = string(linkData[:size])
@@ -253,14 +218,38 @@ func (fsys *Writer) copyFromImage(img *image) error {
 			}
 
 		case disk.StatTypeReg:
-			if layout == disk.LayoutChunkBased && size > 0 {
+			if size > 0 && (layout == disk.LayoutCompressedFull || layout == disk.LayoutCompressedCompact) {
+				ino := &inode{nid: cur.nid, icsize: int8(icSize), xsize: xattrSize, size: int64(size), inodeLayout: layout}
+				ranges, err := (&file{img: img}).encodedRanges(ino)
+				if err != nil {
+					return fmt.Errorf("compressed inheritance %s: %w", cur.path, err)
+				}
+				for i := range ranges {
+					if ranges[i].Device == 0 {
+						return fmt.Errorf("compressed primary device inheritance %s: %w", cur.path, ErrNotImplemented)
+					}
+					if uint32(ranges[i].Device)+uint32(fsys.copyDeviceID)-1 > uint32(^uint16(0)) {
+						return ErrInvalid
+					}
+					ranges[i].Device += fsys.copyDeviceID - 1
+				}
+				fe.encodedRanges = ranges
+			} else if layout == disk.LayoutChunkBased && size > 0 {
 				chunkFmt := uint16(idata)
 				if chunkFmt&disk.LayoutChunkFormatIndexes != 0 {
 					chunkAddr := trailingAddr
 					if chunkAddr%8 != 0 {
 						chunkAddr = (chunkAddr + 7) & ^int64(7)
 					}
-					fe.chunks = fsys.parseChunks(at(chunkAddr), chunkFmt, size, blkBits, img.deviceIDMask)
+					needed := ((size-1)>>(blkBits+uint8(chunkFmt&disk.LayoutChunkFormatBits)) + 1) * disk.SizeChunkIndex
+					if needed > maxChunkIndexBytes {
+						return ErrInvalid
+					}
+					data := at(chunkAddr, int(needed))
+					if len(data) != int(needed) {
+						return io.ErrUnexpectedEOF
+					}
+					fe.chunks = fsys.parseChunks(data, chunkFmt, size, blkBits, img.deviceIDMask)
 					fe.contiguous = chunksAreContiguous(fe.chunks, size, blkBits)
 				}
 			}
@@ -414,7 +403,7 @@ func chunksAreContiguous(chunks []builder.Chunk, fileSize uint64, blkBits uint8)
 // parseXattrsFromBuf parses xattr entries from an in-memory buffer.
 // at provides on-demand access to the shared xattr block at sharedOff.
 // longPrefix resolves long xattr prefix indexes (NameIndex with high bit set).
-func parseXattrsFromBuf(buf []byte, at func(int64) []byte, sharedOff int64, longPrefix func(uint8) (string, error)) map[string]string {
+func parseXattrsFromBuf(buf []byte, at func(int64, int) []byte, sharedOff int64, longPrefix func(uint8) (string, error)) map[string]string {
 	if len(buf) < disk.SizeXattrBodyHeader {
 		return nil
 	}
@@ -435,7 +424,7 @@ func parseXattrsFromBuf(buf []byte, at func(int64) []byte, sharedOff int64, long
 		if sharedOff == 0 {
 			continue
 		}
-		sharedBlock := at(sharedOff + int64(idx)*4)
+		sharedBlock := at(sharedOff+int64(idx)*4, disk.SizeXattrEntry)
 		if sharedBlock == nil || len(sharedBlock) < disk.SizeXattrEntry {
 			continue
 		}
@@ -444,6 +433,7 @@ func parseXattrsFromBuf(buf []byte, at func(int64) []byte, sharedOff int64, long
 			continue
 		}
 		entryLen := int(xe.NameLen) + int(xe.ValueLen)
+		sharedBlock = at(sharedOff+int64(idx)*4, disk.SizeXattrEntry+entryLen)
 		if disk.SizeXattrEntry+entryLen > len(sharedBlock) {
 			continue
 		}

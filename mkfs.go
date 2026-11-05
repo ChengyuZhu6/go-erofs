@@ -23,6 +23,9 @@ import (
 type Writer struct {
 	out          io.WriteSeeker
 	closed       bool
+	hotFiles     []string
+	hotDataEnd   int64
+	compress     bool
 	blockSize    int    // 0 = unset, resolved to defaultBlockSize in Close
 	buildTime    uint64 // from WithBuildTime or buildTimer
 	buildTimeNs  uint32
@@ -71,17 +74,18 @@ type CopyOpt func(*Writer)
 // hardlink group, only the lexicographically first path may provide Data or
 // DataRanges; the remaining paths are inode aliases.
 type SourceEntry struct {
-	Path        string
-	Mode        fs.FileMode
-	Size        int64
-	UID, GID    uint32
-	Rdev        uint32
-	Mtime       time.Time
-	Xattrs      map[string]string
-	LinkTarget  string
-	Data        io.Reader
-	DataRanges  []DataRange
-	HardlinkKey string
+	Path          string
+	Mode          fs.FileMode
+	Size          int64
+	UID, GID      uint32
+	Rdev          uint32
+	Mtime         time.Time
+	Xattrs        map[string]string
+	LinkTarget    string
+	Data          io.Reader
+	EncodedRanges []EncodedRange
+	DataRanges    []DataRange
+	HardlinkKey   string
 }
 
 // SourceEntries describes an explicit tree for CopyEntries.
@@ -116,6 +120,8 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 		byPath:       map[string]*fsEntry{"/": root},
 		dataFile:     o.dataFile,
 		tempDir:      o.tempDir,
+		compress:     o.compress,
+		hotFiles:     o.hotFiles,
 	}
 
 	if o.blockSize != 0 {
@@ -238,7 +244,7 @@ func (fsys *Writer) Create(name string) (*File, error) {
 		entry: e,
 	}
 
-	if fsys.dataFile != nil {
+	if fsys.dataFile != nil && !fsys.compress {
 		f.dataStartOff = fsys.dataOff
 		e.dataStartOff = fsys.dataOff
 	} else {
@@ -549,6 +555,27 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 						}
 					}
 				}
+				if encoded, ok := info.(interface {
+					EncodedRanges() ([]EncodedRange, error)
+				}); ok {
+					ranges, err := encoded.EncodedRanges()
+					if err != nil {
+						return err
+					}
+					if len(ranges) > 0 {
+						for i := range ranges {
+							if ranges[i].Device == 0 {
+								return fmt.Errorf("compressed metadata device inheritance: %w", ErrNotImplemented)
+							}
+							ranges[i].Device += fsys.copyDeviceID - 1
+						}
+						if err := fsys.add(p, &entryFileInfo{info: info, sys: be}); err != nil {
+							return err
+						}
+						fsys.byPath[p].encodedRanges = ranges
+						return nil
+					}
+				}
 				return fsys.add(p, &entryFileInfo{info: info, sys: be})
 			}
 			// For EROFS sources, use direct SectionReader (bypasses
@@ -669,7 +696,7 @@ func (fsys *Writer) CopyEntries(src SourceEntries, opts ...CopyOpt) error {
 				if !sameHardlinkMetadata(previous, entry) {
 					return fmt.Errorf("hardlink key %q has conflicting metadata at %s and %s", entry.HardlinkKey, cleanPath(previous.Path), p)
 				}
-				if entry.Data != nil || len(entry.DataRanges) != 0 {
+				if entry.Data != nil || len(entry.DataRanges) != 0 || len(entry.EncodedRanges) != 0 {
 					return fmt.Errorf("hardlink key %q has multiple content sources", entry.HardlinkKey)
 				}
 			} else if entry.Size > 0 && entry.Data == nil && len(entry.DataRanges) == 0 && !fsys.copyMetadataOnly {
@@ -711,7 +738,7 @@ func (fsys *Writer) copyEntry(entry SourceEntry) error {
 	if entry.HardlinkKey != "" && typ != disk.StatTypeReg {
 		return fmt.Errorf("source entry %s has hardlink key but is not a regular file", p)
 	}
-	if typ == disk.StatTypeReg && entry.Size > 0 && entry.Data == nil && len(entry.DataRanges) == 0 && entry.HardlinkKey == "" && !fsys.copyMetadataOnly {
+	if typ == disk.StatTypeReg && entry.Size > 0 && entry.Data == nil && len(entry.DataRanges) == 0 && len(entry.EncodedRanges) == 0 && entry.HardlinkKey == "" && !fsys.copyMetadataOnly {
 		return fmt.Errorf("source entry %s has no data", p)
 	}
 	be := &builder.Entry{
@@ -743,6 +770,7 @@ func (fsys *Writer) copyEntry(entry SourceEntry) error {
 	}
 	if p != "/" {
 		fsys.byPath[p].hardlinkKey = entry.HardlinkKey
+		fsys.byPath[p].encodedRanges = append([]EncodedRange(nil), entry.EncodedRanges...)
 	}
 	return nil
 }
@@ -788,6 +816,18 @@ func (fsys *Writer) Close() error {
 
 	// Build erofsEntry tree from the fsEntry tree via BFS.
 	root := fsys.buildErofsTree()
+	if fsys.compress {
+		spool, err := fsys.compressTree(root)
+		if err != nil {
+			return err
+		}
+		if spool != nil {
+			defer func() { _ = spool.Close(); _ = os.Remove(spool.Name()) }()
+		}
+		if fsys.dataDeviceID != 0 {
+			fsys.devices[fsys.dataDeviceID-1] = uint64((fsys.dataOff + int64(fsys.blockSize) - 1) / int64(fsys.blockSize))
+		}
+	}
 
 	var chunkBits uint8
 	for cs := fsys.blockSize; cs < 4096; cs <<= 1 {
@@ -840,7 +880,7 @@ func (fsys *Writer) Open(name string) (fs.File, error) {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: fmt.Errorf("file not yet closed for writing")}
 		}
 		var sr *io.SectionReader
-		if fsys.dataFile != nil {
+		if fsys.dataFile != nil && !fsys.compress {
 			sr = io.NewSectionReader(fsys.dataFile, e.dataStartOff, int64(e.size))
 		} else if fsys.spool != nil && e.size > 0 {
 			sr = io.NewSectionReader(fsys.spool, e.dataStartOff, int64(e.size))
@@ -861,7 +901,7 @@ func (f *File) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("mkfs: write to closed file")
 	}
 
-	if f.fs.dataFile != nil {
+	if f.fs.dataFile != nil && !f.fs.compress {
 		if err := f.fs.ensureDataDevice(); err != nil {
 			return 0, err
 		}
@@ -910,7 +950,7 @@ func (f *File) Close() error {
 	f.entry.fileClosed = true
 	f.entry.size = uint64(f.written)
 
-	if f.fs.dataFile != nil {
+	if f.fs.dataFile != nil && !f.fs.compress {
 		return f.closeDataFile()
 	}
 	return nil
@@ -934,21 +974,22 @@ func (f *File) Chown(uid, gid int) error {
 
 // fsEntry is the in-memory representation of a filesystem entry held by Writer.
 type fsEntry struct {
-	path       string
-	mode       uint16
-	uid, gid   uint32
-	atime      uint64
-	atimeNs    uint32
-	mtime      uint64
-	mtimeNs    uint32
-	nlink      uint32
-	nlinkSet   bool // true if SetNlink was called
-	size       uint64
-	rdev       uint32
-	xattrs     map[string]string
-	linkTarget string
-	chunks     []builder.Chunk
-	contiguous bool // data blocks are contiguous; flat-plain is sufficient
+	path          string
+	mode          uint16
+	uid, gid      uint32
+	atime         uint64
+	atimeNs       uint32
+	mtime         uint64
+	mtimeNs       uint32
+	nlink         uint32
+	nlinkSet      bool // true if SetNlink was called
+	size          uint64
+	rdev          uint32
+	xattrs        map[string]string
+	linkTarget    string
+	encodedRanges []EncodedRange
+	chunks        []builder.Chunk
+	contiguous    bool // data blocks are contiguous; flat-plain is sufficient
 
 	// Tree structure — maintained during add/remove.
 	parent   *fsEntry
@@ -973,6 +1014,8 @@ type createOptions struct {
 	blockSize    int      // 0 = use default
 	dataFile     *os.File // external data file for metadata-only mode
 	tempDir      string   // temp directory for spool file
+	compress     bool
+	hotFiles     []string
 }
 
 // blockSizer may be implemented by an fs.FS to declare its block size.
@@ -1034,10 +1077,12 @@ type erofsEntry struct {
 	symTarget string
 
 	// For regular files — metadata-only mode
-	chunks       []builder.Chunk
-	contiguous   bool  // data blocks are contiguous; use large chunk size
-	chunkBits    uint8 // per-entry chunk bits (0 = use global)
-	metadataOnly bool  // chunk-based layout even without chunks
+	encodedRanges []EncodedRange
+	encodedSize   int64
+	chunks        []builder.Chunk
+	contiguous    bool  // data blocks are contiguous; use large chunk size
+	chunkBits     uint8 // per-entry chunk bits (0 = use global)
+	metadataOnly  bool  // chunk-based layout even without chunks
 
 	// For regular files — full-image mode
 	data io.Reader
@@ -1325,7 +1370,7 @@ func (fsys *Writer) add(p string, info fs.FileInfo) error {
 		// Data is stored locally; clear any source chunk mappings.
 		fe.chunks = nil
 		fe.contiguous = false
-		if fsys.dataFile != nil {
+		if fsys.dataFile != nil && !fsys.compress {
 			if err := fsys.ensureDataDevice(); err != nil {
 				return err
 			}
@@ -1552,7 +1597,7 @@ func (fsys *Writer) fsToErofs(e *fsEntry) *erofsEntry {
 	}
 
 	var data io.Reader
-	if fsys.dataFile == nil && len(e.chunks) == 0 && !e.metadataOnly &&
+	if (fsys.dataFile == nil || fsys.compress) && len(e.chunks) == 0 && !e.metadataOnly &&
 		e.mode&disk.StatTypeMask == disk.StatTypeReg && e.size > 0 {
 		if e.directData != nil {
 			data = e.directData
@@ -1573,6 +1618,7 @@ func (fsys *Writer) fsToErofs(e *fsEntry) *erofsEntry {
 		name:          path.Base(e.path),
 		path:          e.path,
 		symTarget:     e.linkTarget,
+		encodedRanges: e.encodedRanges,
 		chunks:        e.chunks,
 		contiguous:    e.contiguous,
 		metadataOnly:  e.metadataOnly,

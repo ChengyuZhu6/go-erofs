@@ -65,8 +65,7 @@ func TestErofs(t *testing.T) {
 		erofstest.SparseFiles.Run(t, erofstest.MkfsErofsMaxSize(1024*1024, chunkFlag))
 	})
 
-	// Compression format is unimplemented — verify EroFS returns ErrNotImplemented.
-	t.Run("lz4-unimplemented", func(t *testing.T) {
+	t.Run("lz4", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("mkfs.erofs compression is not included on Windows")
 		}
@@ -96,9 +95,12 @@ func TestErofs(t *testing.T) {
 			}
 		}()
 
-		_, err = erofs.Open(f)
-		if !errors.Is(err, erofs.ErrNotImplemented) {
-			t.Fatalf("expected ErrNotImplemented, got %v", err)
+		image, err := erofs.Open(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := fs.ReadFile(image, "file.txt"); err != nil || string(got) != "content\n" {
+			t.Fatalf("LZ4 content: %q %v", got, err)
 		}
 	})
 }
@@ -110,6 +112,150 @@ type rejectCompressedPayload struct {
 func (r *rejectCompressedPayload) ReadAt([]byte, int64) (int, error) {
 	r.reads++
 	return 0, errors.New("unexpected payload read")
+}
+
+func TestCompressedWriter(t *testing.T) {
+	for _, external := range []bool{false, true} {
+		root := t.TempDir()
+		meta, err := os.Create(filepath.Join(root, "meta.erofs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer meta.Close()
+		blob, err := os.Create(filepath.Join(root, "blob.erofs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer blob.Close()
+		options := []erofs.CreateOpt{erofs.WithCompression(), erofs.WithBuildTime(0, 0)}
+		if external {
+			options = append(options, erofs.WithDataFile(blob))
+		}
+		large := bytes.Repeat([]byte("pure Go LZ4 disk block"), 65536)
+		plain := make([]byte, 8193)
+		state := uint32(0x13579bdf)
+		for i := range plain {
+			state ^= state << 13
+			state ^= state >> 17
+			state ^= state << 5
+			plain[i] = byte(state)
+		}
+		writer := erofs.Create(meta, options...)
+		if err := writer.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+			{Path: "/large", Mode: 0644, Size: int64(len(large)), Data: bytes.NewReader(large)},
+			{Path: "/plain", Mode: 0644, Size: int64(len(plain)), Data: bytes.NewReader(plain)},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		var readOptions []erofs.OpenOpt
+		if external {
+			readOptions = append(readOptions, erofs.WithExtraDevices(blob))
+		}
+		image, err := erofs.Open(meta, readOptions...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, want := range map[string][]byte{"large": large, "plain": plain} {
+			got, err := fs.ReadFile(image, name)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("compressed writer external=%t %s: %v bytes=%d", external, name, err, len(got))
+			}
+		}
+		info, err := blob.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if external && info.Size() >= int64(len(large))/2 {
+			t.Fatal("compressed writer did not reduce payload")
+		}
+		if external {
+			denied := &rejectCompressedPayload{}
+			parent, err := erofs.Open(meta, erofs.WithExtraDevices(denied))
+			if err != nil {
+				t.Fatal(err)
+			}
+			childMeta, err := os.Create(filepath.Join(root, "child.erofs"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer childMeta.Close()
+			childBlob, err := os.Create(filepath.Join(root, "child.blob"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer childBlob.Close()
+			child := erofs.Create(childMeta, erofs.WithCompression(), erofs.WithDataFile(childBlob), erofs.WithBuildTime(0, 0), erofs.WithHotFiles("new"))
+			if err := child.CopyFrom(parent, erofs.MetadataOnly()); err != nil {
+				t.Fatalf("compressed inheritance: %v", err)
+			}
+			if denied.reads != 0 {
+				t.Fatal("compressed inheritance read parent payload")
+			}
+			newFile, err := child.Create("new")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := newFile.Write(plain); err != nil {
+				t.Fatal(err)
+			}
+			if err := newFile.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := fs.ReadFile(child, "new"); err != nil || !bytes.Equal(got, plain) {
+				t.Fatalf("compression spool readback: %v", err)
+			}
+			if err := child.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if child.HotDataEnd() <= 0 {
+				t.Fatal("hot data prefix was not recorded")
+			}
+			decoded, err := erofs.Open(childMeta, erofs.WithExtraDevices(blob, childBlob))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, want := range map[string][]byte{"large": large, "plain": plain, "new": plain} {
+				got, err := fs.ReadFile(decoded, name)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("inherited compressed file %s: %v", name, err)
+				}
+			}
+		}
+		if _, err := erofstest.CheckMkfsVersion("1.0"); err == nil {
+			args := []string{"--extract=" + filepath.Join(root, "extracted")}
+			oraclePath := meta.Name()
+			if external {
+				// Stock erofs-utils 1.9.4 map_dev subtracts uniaddr without selecting
+				// the device. Flatten its address space only for this decoder oracle.
+				primary, err := os.ReadFile(meta.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload, err := os.ReadFile(blob.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				binary.LittleEndian.PutUint32(primary[1060:1064], uint32((len(primary)+len(payload))/4096))
+				binary.LittleEndian.PutUint32(primary[1104:1108], binary.LittleEndian.Uint32(primary[1104:1108])&^uint32(8))
+				binary.LittleEndian.PutUint16(primary[1110:1112], 0)
+				oraclePath = filepath.Join(root, "unified-reference.erofs")
+				if err := os.WriteFile(oraclePath, append(primary, payload...), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args = append(args, oraclePath)
+			if output, err := exec.Command("fsck.erofs", args...).CombinedOutput(); err != nil {
+				t.Fatalf("independent compressed writer fsck: %v\n%s", err, output)
+			}
+			got, err := os.ReadFile(filepath.Join(root, "extracted/large"))
+			if err != nil || !bytes.Equal(got, large) {
+				t.Fatalf("fsck output: %v", err)
+			}
+		}
+	}
 }
 
 func TestOpenCompressedMetadata(t *testing.T) {
@@ -147,8 +293,8 @@ func TestOpenCompressedMetadata(t *testing.T) {
 				t.Fatal(err)
 			}
 			denied := &rejectCompressedPayload{}
-			if _, err := erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(denied)); !errors.Is(err, erofs.ErrNotImplemented) {
-				t.Fatalf("default Open must still reject compressed filesystems: %v", err)
+			if _, err := erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(denied)); err != nil {
+				t.Fatalf("default Open must accept supported compression without reading payload: %v", err)
 			}
 			image, err := erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(denied), erofs.WithCompressedMetadata())
 			if err != nil {
@@ -203,6 +349,29 @@ func TestOpenCompressedMetadata(t *testing.T) {
 			image, err = erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(data), erofs.WithCompressedMetadata())
 			if err != nil {
 				t.Fatal(err)
+			}
+			decoded, err := erofs.Open(bytes.NewReader(raw), erofs.WithExtraDevices(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"dir/large", "hardlink", "symlink"} {
+				got, err := fs.ReadFile(decoded, name)
+				if err != nil || !bytes.Equal(got, large) {
+					t.Fatalf("pure Go compressed read %s: %v, bytes=%d", name, err, len(got))
+				}
+				file, err := decoded.Open(name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, off := range []int64{0, 4090, 65530, int64(len(large) - 37)} {
+					p := make([]byte, 128)
+					n, err := file.(io.ReaderAt).ReadAt(p, off)
+					want := min(len(p), len(large)-int(off))
+					if n != want || !bytes.Equal(p[:n], large[off:off+int64(n)]) || (want == len(p) && err != nil) || (want < len(p) && !errors.Is(err, io.EOF)) {
+						t.Fatalf("compressed random read %s@%d: n=%d err=%v", name, off, n, err)
+					}
+				}
+				_ = file.Close()
 			}
 			if got, err := fs.ReadFile(image, "small"); err != nil || string(got) != "small payload" {
 				t.Fatalf("uncompressed fallback unreadable: %q, %v", got, err)

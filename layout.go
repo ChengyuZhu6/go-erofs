@@ -63,6 +63,8 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 			switch {
 			case e.size == 0 && len(e.chunks) == 0 && e.data == nil && !e.metadataOnly:
 				e.layout = disk.LayoutFlatPlain
+			case len(e.encodedRanges) > 0:
+				e.layout = disk.LayoutCompressedFull
 			case len(e.chunks) > 0 || e.metadataOnly:
 				e.layout = disk.LayoutChunkBased
 				e.chunkBits = w.chunkBitsFor(e)
@@ -163,7 +165,7 @@ func resolveHardlinkNIDs(e *erofsEntry) {
 // alignment. Non-chunk layouts (inline data) are read without this alignment
 // and so must not be padded.
 func chunkIndexPad(e *erofsEntry) int {
-	if e.layout != disk.LayoutChunkBased || e.trailingSize == 0 {
+	if (e.layout != disk.LayoutChunkBased && e.layout != disk.LayoutCompressedFull) || e.trailingSize == 0 {
 		return 0
 	}
 	if r := (inodeCoreSize(e) + e.xattrSize) % disk.SizeChunkIndex; r != 0 {
@@ -176,6 +178,9 @@ func chunkIndexPad(e *erofsEntry) int {
 func (w *erofsWriter) calcTrailingSize(e *erofsEntry) int {
 	switch e.mode & disk.StatTypeMask {
 	case disk.StatTypeReg:
+		if e.layout == disk.LayoutCompressedFull {
+			return 16 + int((e.size-1)/uint64(w.blockSize)+1)*8
+		}
 		if e.layout == disk.LayoutChunkBased {
 			if e.size == 0 && len(e.chunks) == 0 {
 				return 0

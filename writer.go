@@ -258,6 +258,12 @@ func (w *erofsWriter) assignDataBlocks() {
 // rounded up to block boundary.
 func (w *erofsWriter) sbAreaSize() int {
 	n := disk.SuperBlockOffset + disk.SizeSuperBlock
+	for _, e := range w.entries {
+		if len(e.encodedRanges) > 0 {
+			n += disk.SizeDeviceSlot
+			break
+		}
+	}
 	if len(w.devices) > 0 {
 		n += len(w.devices) * disk.SizeDeviceSlot
 	}
@@ -315,10 +321,19 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 	for _, e := range w.entries {
 		if len(e.chunks) > 0 {
 			featureIncompat |= disk.FeatureIncompatChunkedFile
-			break
+		}
+		if len(e.encodedRanges) > 0 {
+			featureIncompat |= disk.FeatureIncompatLZ4_0Padding | 2
 		}
 	}
 
+	var algorithms uint16
+	if featureIncompat&2 != 0 {
+		algorithms = 1
+		if extraDevices > 0 {
+			devtSlotOff++
+		}
+	}
 	sb := disk.SuperBlock{
 		MagicNumber:     disk.MagicNumber,
 		BlkSizeBits:     blkBits(w.blockSize),
@@ -329,6 +344,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		Blocks:          uint32(totalBlocks),
 		MetaBlkAddr:     w.metaBlkAddr,
 		FeatureIncompat: featureIncompat,
+		ComprAlgs:       algorithms,
 		ExtraDevices:    extraDevices,
 		DevtSlotOff:     devtSlotOff,
 	}
@@ -338,20 +354,31 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		return fmt.Errorf("write superblock: %w", err)
 	}
 	copy(sbArea[disk.SuperBlockOffset:], sbBuf.Bytes())
-
-	// Write device slots right after superblock.
+	if algorithms != 0 {
+		config := sbArea[disk.SuperBlockOffset+disk.SizeSuperBlock:]
+		binary.LittleEndian.PutUint16(config[:2], 14)
+		binary.LittleEndian.PutUint16(config[2:4], 65535)
+		binary.LittleEndian.PutUint16(config[4:6], uint16(maxCompressedBytes/w.blockSize))
+	}
+	var mapped uint64 = uint64(totalBlocks)
+	// Write device slots after the compression configuration.
 	for i, blocks := range w.devices {
 		if blocks > math.MaxUint32 {
 			return fmt.Errorf("device %d block count %d exceeds 32-bit limit", i+1, blocks)
 		}
-		devSlot := disk.DeviceSlot{
-			Blocks: uint32(blocks),
+		devSlot := disk.DeviceSlot{Blocks: uint32(blocks)}
+		if algorithms != 0 {
+			if mapped > math.MaxUint32 {
+				return ErrInvalid
+			}
+			devSlot.MappedBlkAddr = uint32(mapped)
+			mapped += blocks
 		}
 		devBuf := &bytes.Buffer{}
 		if err := binary.Write(devBuf, binary.LittleEndian, &devSlot); err != nil {
 			return fmt.Errorf("write device slot: %w", err)
 		}
-		off := disk.SuperBlockOffset + disk.SizeSuperBlock + i*disk.SizeDeviceSlot
+		off := int(devtSlotOff)*disk.SizeDeviceSlot + i*disk.SizeDeviceSlot
 		copy(sbArea[off:], devBuf.Bytes())
 	}
 
@@ -392,7 +419,15 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 		// Write trailing data
 		switch e.mode & disk.StatTypeMask {
 		case disk.StatTypeReg:
-			if e.layout == disk.LayoutChunkBased && (e.size > 0 || len(e.chunks) > 0) {
+			if e.layout == disk.LayoutCompressedFull {
+				if _, err := buf.Write(w.zeroBuf[:e.chunkPad]); err != nil {
+					return err
+				}
+				if err := w.writeCompressedIndexes(buf, e); err != nil {
+					return fmt.Errorf("compressed indexes %s: %w", e.path, err)
+				}
+				metaStart += e.chunkPad + e.trailingSize
+			} else if e.layout == disk.LayoutChunkBased && (e.size > 0 || len(e.chunks) > 0) {
 				// Align the chunk-index map to the chunk-index unit.
 				if e.chunkPad > 0 {
 					if _, err := buf.Write(w.zeroBuf[:e.chunkPad]); err != nil {
@@ -462,7 +497,16 @@ func (w *erofsWriter) writeInode(buf io.Writer, e *erofsEntry) error {
 
 	switch e.mode & disk.StatTypeMask {
 	case disk.StatTypeReg:
-		if e.layout == disk.LayoutChunkBased {
+		if e.layout == disk.LayoutCompressedFull {
+			var blocks uint64
+			for _, r := range e.encodedRanges {
+				blocks += uint64(r.EncodedSize) / uint64(w.blockSize)
+			}
+			if blocks > math.MaxUint32 {
+				return ErrInvalid
+			}
+			inodeData = uint32(blocks)
+		} else if e.layout == disk.LayoutChunkBased {
 			inodeData = disk.LayoutChunkFormatIndexes | uint32(w.entryChunkBits(e))
 		} else if e.layout == disk.LayoutFlatPlain && e.size > 0 {
 			inodeData = e.dataBlkAddr
@@ -756,6 +800,9 @@ func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
 
 // flatPlainDataSize returns the data size for a flat-plain entry, or 0.
 func (w *erofsWriter) flatPlainDataSize(e *erofsEntry) int {
+	if e.layout == disk.LayoutCompressedFull && e.data != nil {
+		return int(e.encodedSize)
+	}
 	if e.layout != disk.LayoutFlatPlain {
 		return 0
 	}
