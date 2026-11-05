@@ -7,6 +7,7 @@ import (
 	"math/bits"
 	"os"
 	"path"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -35,6 +36,12 @@ type Writer struct {
 	byPath       map[string]*fsEntry // path → entry (all types)
 
 	devices []uint64 // per-device block counts (one per MetadataOnly source)
+
+	hardlinkSources    map[fs.FS]uint64
+	nextHardlinkSource uint64
+	copyHardlinkSource uint64
+	hardlinkData       map[string]*fsEntry
+	sourceReaders      []*copyReader
 
 	// Per-CopyFrom state, reset at the start of each CopyFrom call.
 	copyMetadataOnly bool   // metadata-only for current CopyFrom
@@ -419,9 +426,33 @@ func (fsys *Writer) SetNlink(name string, nlink uint32) error {
 // Opens files for data when Entry.Data is nil.
 // Reads symlink targets via readLinker interface when Entry.LinkTarget is empty.
 // If src implements blockSizer, the image block size is set accordingly.
-func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
+func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) (retErr error) {
 	if fsys.wErr != nil {
 		return fsys.wErr
+	}
+	readerStart := len(fsys.sourceReaders)
+	defer func() {
+		if retErr != nil {
+			for _, reader := range fsys.sourceReaders[readerStart:] {
+				_ = reader.Close()
+			}
+		}
+	}()
+	// Inode numbers are local to a source, but repeated copies of that source
+	// must retain their identity. Only the ordinal affects the output tree.
+	fsys.copyHardlinkSource = 0
+	if reflect.ValueOf(src).Comparable() {
+		fsys.copyHardlinkSource = fsys.hardlinkSources[src]
+	}
+	if fsys.copyHardlinkSource == 0 {
+		fsys.nextHardlinkSource++
+		fsys.copyHardlinkSource = fsys.nextHardlinkSource
+		if reflect.ValueOf(src).Comparable() {
+			if fsys.hardlinkSources == nil {
+				fsys.hardlinkSources = make(map[fs.FS]uint64)
+			}
+			fsys.hardlinkSources[src] = fsys.copyHardlinkSource
+		}
 	}
 	// Reset per-CopyFrom state.
 	fsys.copyMetadataOnly = false
@@ -432,10 +463,9 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 		opt(fsys)
 	}
 	// Detect EROFS image source for direct metadata/chunk extraction.
-	// The fast path (copyFromImage) only applies to MetadataOnly mode
-	// where no file data needs to be read — just inodes, dirents, and
-	// chunk indexes. For non-MetadataOnly, fall through to the fs.WalkDir
-	// path which opens files for data.
+	// The fast path (copyFromImage) inherits external data in MetadataOnly
+	// mode, copying inline contents that cannot be inherited. Other copies
+	// fall through to fs.WalkDir, which opens files for data.
 	if srcImg, ok := src.(*image); ok {
 		if err := fsys.setBlockSize(int(srcImg.blockSize())); err != nil {
 			return err
@@ -446,8 +476,12 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 		}
 		if fsys.copyMetadataOnly {
 			devBlocks := srcImg.deviceBlocks()
+			if len(fsys.devices)+len(devBlocks) > int(^uint16(0)) {
+				return ErrInvalid
+			}
 			fsys.devices = append(fsys.devices, devBlocks...)
 			fsys.copyDeviceID = uint16(len(fsys.devices) - len(devBlocks) + 1)
+			fsys.copyDeviceCount = uint16(len(devBlocks))
 			return fsys.copyFromImage(srcImg)
 		}
 	}
@@ -499,14 +533,16 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 		case *Stat:
 			// EROFS image source: convert *Stat to *builder.Entry.
 			be = &builder.Entry{
-				UID:         sys.UID,
-				GID:         sys.GID,
-				Mtime:       sys.Mtime,
-				MtimeNs:     sys.MtimeNs,
-				Nlink:       uint32(sys.Nlink),
-				Rdev:        sys.Rdev,
-				Xattrs:      sys.Xattrs,
-				HardlinkKey: erofsHardlinkKey(info, sys),
+				UID:     sys.UID,
+				GID:     sys.GID,
+				Mtime:   sys.Mtime,
+				MtimeNs: sys.MtimeNs,
+				Nlink:   uint32(sys.Nlink),
+				Rdev:    sys.Rdev,
+				Xattrs:  sys.Xattrs,
+			}
+			if info.Mode().IsRegular() && sys.Nlink > 1 {
+				be.HardlinkKey = fmt.Sprintf("erofs:%d:%d", fsys.copyHardlinkSource, sys.Ino)
 			}
 		}
 		if fsys.copyMerge && p != "/" {
@@ -604,7 +640,9 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 					be = &builder.Entry{}
 				}
 			}
-			be.Data = f.(io.Reader)
+			reader := &copyReader{ReadCloser: f}
+			fsys.sourceReaders = append(fsys.sourceReaders, reader)
+			be.Data = reader
 			return fsys.add(p, &entryFileInfo{info: info, sys: be})
 		}
 
@@ -771,6 +809,7 @@ func (fsys *Writer) copyEntry(entry SourceEntry) error {
 	if p != "/" {
 		fsys.byPath[p].hardlinkKey = entry.HardlinkKey
 		fsys.byPath[p].encodedRanges = append([]EncodedRange(nil), entry.EncodedRanges...)
+		fsys.retainHardlinkData(fsys.byPath[p])
 	}
 	return nil
 }
@@ -790,6 +829,12 @@ func cloneXattrs(xattrs map[string]string) map[string]string {
 
 // Close writes the EROFS image. The FS must not be used after Close.
 func (fsys *Writer) Close() error {
+	defer func() {
+		for _, reader := range fsys.sourceReaders {
+			_ = reader.Close()
+		}
+		fsys.sourceReaders = nil
+	}()
 	if fsys.wErr != nil {
 		return fsys.wErr
 	}
@@ -841,12 +886,17 @@ func (fsys *Writer) Close() error {
 		blockSize:   fsys.blockSize,
 		chunkBits:   chunkBits,
 		zeroBuf:     make([]byte, fsys.blockSize),
+		hotFiles:    fsys.hotFiles,
 	}
 
 	ew.planLayout(root)
 	fixParentNids(root, root)
 
-	return ew.write(fsys.out)
+	err := ew.write(fsys.out)
+	if fsys.dataFile == nil {
+		fsys.hotDataEnd = ew.hotDataEnd
+	}
+	return err
 }
 
 // Stat returns file info for the named path. The name is cleaned the same
@@ -1004,6 +1054,19 @@ type fsEntry struct {
 	removed      bool // true if removed by a whiteout in a merge layer
 	metadataOnly bool // from a metadata-only CopyFrom; use chunk-based layout
 	hardlinkKey  string
+}
+
+type copyReader struct {
+	io.ReadCloser
+	closed bool
+}
+
+func (r *copyReader) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	return r.ReadCloser.Close()
 }
 
 // createOptions holds the parsed option values for Create.
@@ -1334,7 +1397,11 @@ func (fsys *Writer) add(p string, info fs.FileInfo) error {
 
 	// Handle duplicate paths (overwrite semantics).
 	if existing, ok := fsys.byPath[p]; ok {
-		// Preserve tree linkage when overwriting.
+		if existing.mode&disk.StatTypeMask == disk.StatTypeDir && typ != disk.StatTypeDir {
+			fsys.removeSubtree(existing)
+			existing.children = nil
+		}
+		// Preserve parent linkage and surviving directory children.
 		savedParent := existing.parent
 		savedChildren := existing.children
 		*existing = *fe
@@ -1393,7 +1460,23 @@ func (fsys *Writer) add(p string, info fs.FileInfo) error {
 		fe.fileClosed = true
 	}
 
+	fsys.retainHardlinkData(fe)
 	return nil
+}
+
+func (fsys *Writer) retainHardlinkData(e *fsEntry) {
+	if e.hardlinkKey == "" || (e.directData == nil && len(e.chunks) == 0 && len(e.encodedRanges) == 0) {
+		return
+	}
+	if fsys.hardlinkData == nil {
+		fsys.hardlinkData = make(map[string]*fsEntry)
+	}
+	// Keep content separate from path entries, which overlays mutate in place.
+	fsys.hardlinkData[e.hardlinkKey] = &fsEntry{
+		directData: e.directData, chunks: e.chunks, encodedRanges: e.encodedRanges,
+		contiguous: e.contiguous, metadataOnly: e.metadataOnly,
+		spoolOff: e.spoolOff, dataStartOff: e.dataStartOff,
+	}
 }
 
 // checkPath validates that a path hasn't already been registered.
@@ -1596,13 +1679,17 @@ func (fsys *Writer) fsToErofs(e *fsEntry) *erofsEntry {
 		nlink = 1
 	}
 
+	content := e
+	if saved := fsys.hardlinkData[e.hardlinkKey]; e.hardlinkKey != "" && saved != nil {
+		content = saved
+	}
 	var data io.Reader
-	if (fsys.dataFile == nil || fsys.compress) && len(e.chunks) == 0 && !e.metadataOnly &&
+	if (fsys.dataFile == nil || fsys.compress) && len(content.chunks) == 0 && !content.metadataOnly &&
 		e.mode&disk.StatTypeMask == disk.StatTypeReg && e.size > 0 {
-		if e.directData != nil {
-			data = e.directData
+		if content.directData != nil {
+			data = content.directData
 		} else if fsys.spool != nil {
-			data = io.NewSectionReader(fsys.spool, e.spoolOff, int64(e.size))
+			data = io.NewSectionReader(fsys.spool, content.spoolOff, int64(e.size))
 		}
 	}
 
@@ -1618,10 +1705,10 @@ func (fsys *Writer) fsToErofs(e *fsEntry) *erofsEntry {
 		name:          path.Base(e.path),
 		path:          e.path,
 		symTarget:     e.linkTarget,
-		encodedRanges: e.encodedRanges,
-		chunks:        e.chunks,
-		contiguous:    e.contiguous,
-		metadataOnly:  e.metadataOnly,
+		encodedRanges: content.encodedRanges,
+		chunks:        content.chunks,
+		contiguous:    content.contiguous,
+		metadataOnly:  content.metadataOnly,
 		data:          data,
 		xattrs:        e.xattrs,
 		erofsFileType: modeToFileType(e.mode),

@@ -176,7 +176,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 			xattrs:  xattrs,
 		}
 		if typ == disk.StatTypeReg && nlink > 1 {
-			fe.hardlinkKey = fmt.Sprintf("erofs:%d", cur.nid)
+			fe.hardlinkKey = fmt.Sprintf("erofs:%d:%d", fsys.copyHardlinkSource, cur.nid)
 		}
 		if nlink > 0 {
 			fe.nlink = nlink
@@ -234,23 +234,36 @@ func (fsys *Writer) copyFromImage(img *image) error {
 					ranges[i].Device += fsys.copyDeviceID - 1
 				}
 				fe.encodedRanges = ranges
-			} else if layout == disk.LayoutChunkBased && size > 0 {
-				chunkFmt := uint16(idata)
-				if chunkFmt&disk.LayoutChunkFormatIndexes != 0 {
-					chunkAddr := trailingAddr
-					if chunkAddr%8 != 0 {
-						chunkAddr = (chunkAddr + 7) & ^int64(7)
+			} else if size > 0 && (layout == disk.LayoutFlatPlain || layout == disk.LayoutChunkBased) {
+				ino := &inode{nid: cur.nid, icsize: int8(icSize), xsize: xattrSize, size: int64(size), inodeLayout: layout, inodeData: idata}
+				f := &file{img: img}
+				ranges := f.buildDataRanges(ino)
+				if layout == disk.LayoutChunkBased {
+					var err error
+					ranges, err = f.buildChunkDataRanges(ino)
+					if err != nil {
+						return fmt.Errorf("chunk inheritance %s: %w", cur.path, err)
 					}
-					needed := ((size-1)>>(blkBits+uint8(chunkFmt&disk.LayoutChunkFormatBits)) + 1) * disk.SizeChunkIndex
-					if needed > maxChunkIndexBytes {
-						return ErrInvalid
+				}
+				for i := range ranges {
+					if ranges[i].Offset == holeOffset {
+						continue
 					}
-					data := at(chunkAddr, int(needed))
-					if len(data) != int(needed) {
-						return io.ErrUnexpectedEOF
+					if ranges[i].Device == 0 {
+						return fmt.Errorf("primary device inheritance %s: %w", cur.path, ErrNotImplemented)
 					}
-					fe.chunks = fsys.parseChunks(data, chunkFmt, size, blkBits, img.deviceIDMask)
-					fe.contiguous = chunksAreContiguous(fe.chunks, size, blkBits)
+					// Image ranges use on-disk device IDs; explicit source ranges are zero-based.
+					ranges[i].Device--
+				}
+				chunks, err := fsys.chunksFromRanges(ranges, int64(size))
+				if err != nil {
+					return fmt.Errorf("data inheritance %s: %w", cur.path, err)
+				}
+				fe.chunks = chunks
+				fe.contiguous = chunksAreContiguous(chunks, size, blkBits)
+			} else if size > 0 && layout == disk.LayoutFlatInline {
+				if err := fsys.copyInlineData(img, fe); err != nil {
+					return fmt.Errorf("inline data copy %s: %w", cur.path, err)
 				}
 			}
 
@@ -258,13 +271,15 @@ func (fsys *Writer) copyFromImage(img *image) error {
 			fe.rdev = disk.RdevFromMode(mode, idata)
 		}
 
-		// Remap chunk DeviceIDs for metadata-only sources.
-		if fsys.copyMetadataOnly && fsys.copyDeviceID > 0 {
+		// Remap inherited chunks only; locally copied data already uses output device IDs.
+		if fe.metadataOnly && fsys.copyDeviceID > 0 {
 			offset := fsys.copyDeviceID - 1
 			for i := range fe.chunks {
 				fe.chunks[i].DeviceID += offset
 			}
 		}
+
+		fsys.retainHardlinkData(fe)
 
 		// Register in the tree.
 		if cur.path == "/" {
@@ -278,7 +293,11 @@ func (fsys *Writer) copyFromImage(img *image) error {
 			fsys.root.nlinkSet = fe.nlinkSet
 			fsys.root.xattrs = fe.xattrs
 		} else if existing, ok := fsys.byPath[cur.path]; ok {
-			// Merge overwrites: preserve tree linkage.
+			if existing.mode&disk.StatTypeMask == disk.StatTypeDir && mode&disk.StatTypeMask != disk.StatTypeDir {
+				fsys.removeSubtree(existing)
+				existing.children = nil
+			}
+			// Preserve parent linkage and surviving directory children.
 			savedParent := existing.parent
 			savedChildren := existing.children
 			*existing = *fe
@@ -288,6 +307,38 @@ func (fsys *Writer) copyFromImage(img *image) error {
 			fsys.addChild(fe)
 		}
 	}
+	return nil
+}
+
+func (fsys *Writer) copyInlineData(img *image, e *fsEntry) error {
+	src, err := img.Open(e.path[1:])
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst := &File{fs: fsys, entry: e}
+	if fsys.dataFile != nil && !fsys.compress {
+		dst.dataStartOff = fsys.dataOff
+		e.dataStartOff = fsys.dataOff
+	} else {
+		if err := fsys.ensureSpool(); err != nil {
+			return err
+		}
+		e.spoolOff = fsys.spoolOff
+		dst.dataStartOff = fsys.spoolOff
+	}
+	n, err := dst.ReadFrom(src)
+	if err != nil {
+		return err
+	}
+	if uint64(n) != e.size {
+		return io.ErrUnexpectedEOF
+	}
+	if err := dst.Close(); err != nil {
+		return err
+	}
+	e.metadataOnly = false
 	return nil
 }
 
@@ -311,37 +362,6 @@ func (img *image) directoryEntries(nid uint64) ([]imgDirEntry, error) {
 		result = append(result, imgDirEntry{nid: de.nid, name: de.name})
 	}
 	return result, nil
-}
-
-// parseChunks extracts chunk index entries from an in-memory buffer.
-func (fsys *Writer) parseChunks(data []byte, chunkFmt uint16, fileSize uint64, blkBits uint8, deviceIDMask uint16) []builder.Chunk {
-	chunkBits := blkBits + uint8(chunkFmt&disk.LayoutChunkFormatBits)
-	nchunks := int((fileSize-1)>>chunkBits) + 1
-	blocksPerChunk := uint64(1) << (chunkBits - blkBits)
-
-	// Align to 8 bytes for index entries.
-	needed := nchunks * disk.SizeChunkIndex
-	if len(data) < needed {
-		return nil
-	}
-
-	chunks := make([]builder.Chunk, 0, nchunks)
-	for i := range nchunks {
-		off := i * disk.SizeChunkIndex
-		startBlkLo := binary.LittleEndian.Uint32(data[off+4 : off+8])
-		if ^startBlkLo == 0 {
-			// Preserve null indexes so later data remains at the correct logical
-			// position. appendChunkRun splits long holes at the uint16 Count limit.
-			chunks = appendChunkRun(chunks, builder.NullPhysicalBlock, blocksPerChunk, 0)
-			continue
-		}
-		startBlkHi := binary.LittleEndian.Uint16(data[off : off+2])
-		deviceID := binary.LittleEndian.Uint16(data[off+2:off+4]) & deviceIDMask
-		physBlock := (uint64(startBlkHi) << 32) | uint64(startBlkLo)
-
-		chunks = appendChunkRun(chunks, physBlock, blocksPerChunk, deviceID)
-	}
-	return chunks
 }
 
 func appendChunkRun(chunks []builder.Chunk, physicalBlock, count uint64, deviceID uint16) []builder.Chunk {

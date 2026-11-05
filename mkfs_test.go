@@ -320,6 +320,522 @@ func TestCopyFromPreservesHardlinkIdentity(t *testing.T) {
 	}
 }
 
+func TestCopyFromImageHardlinkSourcesAreIndependent(t *testing.T) {
+	makeSource := func(a, b, data string) fs.FS {
+		t.Helper()
+		var buf testBuffer
+		w := erofs.Create(&buf, erofs.WithBuildTime(1700000000, 0))
+		if err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+			{Path: a, Mode: 0o644, Size: int64(len(data)), Data: bytes.NewBufferString(data), HardlinkKey: "pair"},
+			{Path: b, Mode: 0o644, Size: int64(len(data)), HardlinkKey: "pair"},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		src, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return src
+	}
+	first := makeSource("/a", "/b", "first")
+	second := makeSource("/c", "/d", "other")
+	if erofstest.Stat(t, first, "a").Ino != erofstest.Stat(t, second, "c").Ino {
+		t.Fatal("fixture must reuse inode numbers across independent images")
+	}
+	var previous []byte
+	for range 2 {
+		var buf testBuffer
+		w := erofs.Create(&buf, erofs.WithBuildTime(1700000000, 0))
+		for _, src := range []fs.FS{first, second, first} {
+			if err := w.CopyFrom(src, erofs.Merge()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		result, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, b := erofstest.Stat(t, result, "a"), erofstest.Stat(t, result, "b")
+		c, d := erofstest.Stat(t, result, "c"), erofstest.Stat(t, result, "d")
+		if a.Ino != b.Ino || c.Ino != d.Ino || a.Ino == c.Ino || a.Nlink != 2 || c.Nlink != 2 {
+			t.Fatalf("independent hardlink pairs: a=%+v b=%+v c=%+v d=%+v", a, b, c, d)
+		}
+		erofstest.CheckFile(t, result, "b", "first")
+		erofstest.CheckFile(t, result, "d", "other")
+		if previous != nil && !bytes.Equal(previous, buf.Bytes()) {
+			t.Fatal("same source sequence produces nondeterministic layout")
+		}
+		previous = append([]byte(nil), buf.Bytes()...)
+	}
+}
+
+func TestCopyEntriesHardlinkContentSurvivesTreeChanges(t *testing.T) {
+	for _, mode := range []string{"direct", "ranges", "encoded", "datafile", "compressed-datafile"} {
+		for _, change := range []string{"remove", "overwrite", "whiteout", "opaque", "subtree"} {
+			t.Run(mode+"/"+change, func(t *testing.T) {
+				metadataOnly := mode == "ranges" || mode == "encoded"
+				data := bytes.Repeat([]byte("original"), 1024)
+				var buf testBuffer
+				var external *os.File
+				var createOpts []erofs.CreateOpt
+				if mode == "datafile" || mode == "compressed-datafile" {
+					var err error
+					external, err = os.CreateTemp(t.TempDir(), "data")
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer external.Close()
+					createOpts = append(createOpts, erofs.WithDataFile(external))
+					if mode == "compressed-datafile" {
+						createOpts = append(createOpts, erofs.WithCompression())
+					}
+				}
+				w := erofs.Create(&buf, createOpts...)
+				if external != nil {
+					if err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{{Path: "/prefix", Mode: 0o644, Size: 4096, Data: bytes.NewReader(bytes.Repeat([]byte("p"), 4096))}}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				entries := erofs.SourceEntries{Entries: []erofs.SourceEntry{
+					{Path: "/dir/a", Mode: 0o644, Size: int64(len(data)), HardlinkKey: "pair"},
+					{Path: "/z", Mode: 0o644, Size: int64(len(data)), HardlinkKey: "pair"},
+					{Path: "/zz", Mode: 0o644, Size: int64(len(data)), HardlinkKey: "pair"},
+				}}
+				var opts []erofs.CopyOpt
+				if metadataOnly {
+					opts = append(opts, erofs.MetadataOnly())
+					entries.BlockSize = 4096
+					entries.ExternalDeviceBlocks = []uint64{2}
+					if mode == "encoded" {
+						entries.Entries[0].EncodedRanges = []erofs.EncodedRange{{Device: 1, Offset: 0, EncodedSize: int64(len(data)), Size: int64(len(data)), Algorithm: 254}}
+					} else {
+						entries.Entries[0].DataRanges = []erofs.DataRange{{Device: 0, Offset: 0, Size: int64(len(data))}}
+					}
+				} else {
+					entries.Entries[0].Data = bytes.NewReader(data)
+				}
+				if err := w.CopyEntries(entries, opts...); err != nil {
+					t.Fatal(err)
+				}
+				switch change {
+				case "remove", "subtree":
+					p := "/dir/a"
+					if change == "subtree" {
+						p = "/dir"
+					}
+					if err := w.CopyEntries(erofs.SourceEntries{RemovePaths: []string{p}}); err != nil {
+						t.Fatal(err)
+					}
+				case "overwrite":
+					if err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{{Path: "/dir/a", Mode: 0o644, Size: 3, Data: bytes.NewBufferString("new")}}}); err != nil {
+						t.Fatal(err)
+					}
+				case "whiteout":
+					if err := w.CopyFrom(fstest.MapFS{"dir/.wh.a": &fstest.MapFile{}}, erofs.Merge()); err != nil {
+						t.Fatal(err)
+					}
+				case "opaque":
+					if err := w.CopyFrom(fstest.MapFS{"dir/.wh..wh..opq": &fstest.MapFile{}}, erofs.Merge()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+				var openOpts []erofs.OpenOpt
+				if metadataOnly {
+					openOpts = append(openOpts, erofs.WithExtraDevices(bytes.NewReader(data)))
+				}
+				if mode == "datafile" || mode == "compressed-datafile" {
+					openOpts = append(openOpts, erofs.WithExtraDevices(external))
+				}
+				result, err := erofs.Open(bytes.NewReader(buf.Bytes()), openOpts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				erofstest.CheckFileBytes(t, result, "z", data)
+				erofstest.CheckFileBytes(t, result, "zz", data)
+				z, zz := erofstest.Stat(t, result, "z"), erofstest.Stat(t, result, "zz")
+				if z.Ino != zz.Ino || z.Nlink != 2 {
+					t.Fatalf("surviving hardlinks: z=%+v zz=%+v", z, zz)
+				}
+				if change == "overwrite" {
+					erofstest.CheckFile(t, result, "dir/a", "new")
+				}
+			})
+		}
+	}
+}
+
+func TestDirectoryReplacementPreservesVisibleHardlinks(t *testing.T) {
+	for _, source := range []string{"entries", "metadata-image"} {
+		for _, replacement := range []string{"file", "symlink", "directory"} {
+			t.Run(source+"/"+replacement, func(t *testing.T) {
+				data := bytes.Repeat([]byte("original"), 1024)
+				var buf testBuffer
+				w := erofs.Create(&buf)
+				if err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+					{Path: "/dir/a", Mode: 0o640, Size: int64(len(data)), Data: bytes.NewReader(data), HardlinkKey: "pair"},
+					{Path: "/z", Mode: 0o640, Size: int64(len(data)), HardlinkKey: "pair"},
+					{Path: "/zz", Mode: 0o640, Size: int64(len(data)), HardlinkKey: "pair"},
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				entry := erofs.SourceEntry{Path: "/dir", Mode: 0o644, Size: 5, Data: bytes.NewBufferString("upper")}
+				switch replacement {
+				case "symlink":
+					entry = erofs.SourceEntry{Path: "/dir", Mode: fs.ModeSymlink | 0o777, LinkTarget: "/z"}
+				case "directory":
+					entry = erofs.SourceEntry{Path: "/dir", Mode: fs.ModeDir | 0o700}
+				}
+				upper := erofs.SourceEntries{Entries: []erofs.SourceEntry{entry}}
+				if source == "entries" {
+					if err := w.CopyEntries(upper); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					var image testBuffer
+					base := erofs.Create(&image)
+					if err := base.CopyEntries(upper); err != nil {
+						t.Fatal(err)
+					}
+					if err := base.Close(); err != nil {
+						t.Fatal(err)
+					}
+					src, err := erofs.Open(bytes.NewReader(image.Bytes()))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := w.CopyFrom(src, erofs.MetadataOnly(), erofs.Merge()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+				result, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				erofstest.CheckFileBytes(t, result, "z", data)
+				erofstest.CheckFileBytes(t, result, "zz", data)
+				z, zz := erofstest.Stat(t, result, "z"), erofstest.Stat(t, result, "zz")
+				wantLinks := 2
+				if replacement == "directory" {
+					wantLinks = 3
+					erofstest.CheckFileBytes(t, result, "dir/a", data)
+					if a := erofstest.Stat(t, result, "dir/a"); a.Ino != z.Ino || a.Nlink != wantLinks {
+						t.Fatalf("directory replacement lost inherited hardlink: a=%+v z=%+v", a, z)
+					}
+				} else if _, err := fs.Stat(result, "dir/a"); err == nil {
+					t.Fatal("non-directory replacement retained an inherited child")
+				}
+				if z.Ino != zz.Ino || z.Nlink != wantLinks || zz.Nlink != wantLinks {
+					t.Fatalf("visible hardlinks: z=%+v zz=%+v, want nlink %d", z, zz, wantLinks)
+				}
+				switch replacement {
+				case "file":
+					erofstest.CheckFile(t, result, "dir", "upper")
+				case "symlink":
+					erofstest.CheckFileBytes(t, result, "dir", data)
+				}
+			})
+		}
+	}
+}
+
+func TestCopyFromNonComparableWrappedSource(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	source := struct{ fs.FS }{FS: fstest.MapFS{"file": &fstest.MapFile{Mode: 0o644, Data: []byte("data")}}}
+	if err := w.CopyFrom(source); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	erofstest.CheckFile(t, result, "file", "data")
+}
+
+type trackedCopyFS struct {
+	fs.FS
+	files    []*trackedCopyFile
+	failOpen string
+}
+
+func (s *trackedCopyFS) Open(name string) (fs.File, error) {
+	if name == s.failOpen {
+		return nil, fs.ErrPermission
+	}
+	f, err := s.FS.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return f, nil
+	}
+	tracked := &trackedCopyFile{File: f}
+	s.files = append(s.files, tracked)
+	return tracked, nil
+}
+
+type trackedCopyFile struct {
+	fs.File
+	closes int
+}
+
+func (f *trackedCopyFile) Close() error {
+	f.closes++
+	return f.File.Close()
+}
+
+type failingCopyOutput struct{ testBuffer }
+
+func (w *failingCopyOutput) Write([]byte) (int, error) { return 0, fs.ErrPermission }
+
+func TestCopyFromClosesEveryOpenedHardlink(t *testing.T) {
+	for _, outcome := range []string{"success", "copy-error", "output-error", "overwrite"} {
+		t.Run(outcome, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "a00"), []byte("shared data"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for i := 1; i < 17; i++ {
+				if err := os.Link(filepath.Join(root, "a00"), filepath.Join(root, fmt.Sprintf("a%02d", i))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			src := &trackedCopyFS{FS: os.DirFS(root)}
+			var buf testBuffer
+			var out io.WriteSeeker = &buf
+			if outcome == "output-error" {
+				out = &failingCopyOutput{}
+			}
+			if outcome == "copy-error" {
+				if err := os.WriteFile(filepath.Join(root, "z"), []byte("later"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				src.failOpen = "z"
+			}
+			w := erofs.Create(out)
+			err := w.CopyFrom(src)
+			if outcome == "copy-error" {
+				if !errors.Is(err, fs.ErrPermission) {
+					t.Fatalf("CopyFrom error=%v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if outcome == "overwrite" {
+					if err := w.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{{Path: "/a00", Mode: 0o644, Size: 3, Data: bytes.NewBufferString("new")}}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				err = w.Close()
+				if outcome == "output-error" {
+					if !errors.Is(err, fs.ErrPermission) {
+						t.Fatalf("Close error=%v", err)
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+					result, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+					if err != nil {
+						t.Fatal(err)
+					}
+					erofstest.CheckFile(t, result, "a16", "shared data")
+				}
+			}
+			if len(src.files) == 0 {
+				t.Fatal("no file reader was tracked")
+			}
+			for i, f := range src.files {
+				if f.closes != 1 {
+					t.Errorf("reader %d closed %d times, want once", i, f.closes)
+				}
+			}
+		})
+	}
+}
+
+func TestCopyFromMetadataOnlyMappedUncompressedData(t *testing.T) {
+	for _, layout := range []string{"flatplain", "unified-chunks", "explicit-chunks", "hole-chunks"} {
+		t.Run(layout, func(t *testing.T) {
+			data := bytes.Repeat([]byte("mapped!!"), 1024)
+			device := append(make([]byte, 4096), data...)
+			var source testBuffer
+			base := erofs.Create(&source, erofs.WithBuildTime(0, 0))
+			ranges := []erofs.DataRange{{Device: 0, Offset: 4096, Size: int64(len(data))}}
+			if layout == "hole-chunks" {
+				ranges = []erofs.DataRange{{Offset: -1, Size: 4096}, {Device: 0, Offset: 8192, Size: 4096}}
+				data = append(make([]byte, 4096), data[4096:]...)
+			}
+			if err := base.CopyEntries(erofs.SourceEntries{BlockSize: 4096, ExternalDeviceBlocks: []uint64{3}, Entries: []erofs.SourceEntry{
+				{Path: "/file", Mode: 0o644, Size: int64(len(data)), DataRanges: ranges},
+			}}, erofs.MetadataOnly()); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.Close(); err != nil {
+				t.Fatal(err)
+			}
+			original, err := erofs.Open(bytes.NewReader(source.Bytes()), erofs.WithExtraDevices(bytes.NewReader(device)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			st := erofstest.Stat(t, original, "file")
+			imageBytes := append([]byte(nil), source.Bytes()...)
+			var sb disk.SuperBlock
+			if _, err := binary.Decode(imageBytes[1024:1024+disk.SizeSuperBlock], binary.LittleEndian, &sb); err != nil {
+				t.Fatal(err)
+			}
+			slotOff := int(sb.DevtSlotOff) * disk.SizeDeviceSlot
+			var slot disk.DeviceSlot
+			if _, err := binary.Decode(imageBytes[slotOff:slotOff+disk.SizeDeviceSlot], binary.LittleEndian, &slot); err != nil {
+				t.Fatal(err)
+			}
+			slot.MappedBlkAddr = 100
+			binary.LittleEndian.PutUint32(imageBytes[slotOff+68:], slot.MappedBlkAddr)
+			inodeOff := (int(sb.MetaBlkAddr) << sb.BlkSizeBits) + int(st.Ino)*disk.SizeInodeCompact
+			if layout == "flatplain" {
+				binary.LittleEndian.PutUint16(imageBytes[inodeOff:], 0)
+				binary.LittleEndian.PutUint32(imageBytes[inodeOff+16:], slot.MappedBlkAddr+1)
+			} else if layout != "explicit-chunks" {
+				for off := inodeOff + disk.SizeInodeCompact; off < inodeOff+disk.SizeInodeCompact+2*disk.SizeChunkIndex; off += disk.SizeChunkIndex {
+					block := binary.LittleEndian.Uint32(imageBytes[off+4:])
+					if block == ^uint32(0) {
+						continue
+					}
+					binary.LittleEndian.PutUint16(imageBytes[off+2:], 0)
+					binary.LittleEndian.PutUint32(imageBytes[off+4:], slot.MappedBlkAddr+block)
+				}
+			}
+			src, err := erofs.Open(bytes.NewReader(imageBytes), erofs.WithExtraDevices(bytes.NewReader(device)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			erofstest.CheckFileBytes(t, src, "file", data)
+			var copied testBuffer
+			w := erofs.Create(&copied)
+			if err := w.CopyFrom(src, erofs.MetadataOnly()); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			result, err := erofs.Open(bytes.NewReader(copied.Bytes()), erofs.WithExtraDevices(bytes.NewReader(device)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			erofstest.CheckFileBytes(t, result, "file", data)
+		})
+	}
+}
+
+func TestCopyFromMetadataOnlyPreservesPrimaryInlineData(t *testing.T) {
+	for _, size := range []int{13, 4096 + 13} {
+		for _, output := range []string{"image", "datafile", "compressed-datafile"} {
+			t.Run(fmt.Sprintf("size=%d/%s", size, output), func(t *testing.T) {
+				data := bytes.Repeat([]byte("inline payload"), (size+13)/14)[:size]
+				var source testBuffer
+				base := erofs.Create(&source, erofs.WithBuildTime(0, 0))
+				if err := base.CopyEntries(erofs.SourceEntries{Entries: []erofs.SourceEntry{
+					{Path: "/a", Mode: 0o644, Size: 13, Data: bytes.NewReader(data[len(data)-13:]), HardlinkKey: "inline"},
+					{Path: "/b", Mode: 0o644, Size: 13, HardlinkKey: "inline"},
+					{Path: "/c", Mode: 0o644, Size: 13, HardlinkKey: "inline"},
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				if err := base.Close(); err != nil {
+					t.Fatal(err)
+				}
+				src, err := erofs.Open(bytes.NewReader(source.Bytes()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				st := erofstest.Stat(t, src, "a")
+				if st.InodeLayout != disk.LayoutFlatInline {
+					t.Fatalf("fixture layout = %d, want flatinline", st.InodeLayout)
+				}
+				if size > 4096 {
+					imageBytes := append([]byte(nil), source.Bytes()...)
+					var sb disk.SuperBlock
+					if _, err := binary.Decode(imageBytes[1024:1024+disk.SizeSuperBlock], binary.LittleEndian, &sb); err != nil {
+						t.Fatal(err)
+					}
+					inodeOff := (int(sb.MetaBlkAddr) << sb.BlkSizeBits) + int(st.Ino)*disk.SizeInodeCompact
+					if binary.LittleEndian.Uint16(imageBytes[inodeOff:])&1 != 0 {
+						t.Fatal("fixture must use compact inode")
+					}
+					binary.LittleEndian.PutUint32(imageBytes[inodeOff+8:], uint32(size))
+					binary.LittleEndian.PutUint32(imageBytes[inodeOff+16:], uint32(len(imageBytes)>>sb.BlkSizeBits))
+					imageBytes = append(imageBytes, data[:4096]...)
+					binary.LittleEndian.PutUint32(imageBytes[1024+36:], uint32(len(imageBytes)>>sb.BlkSizeBits))
+					src, err = erofs.Open(bytes.NewReader(imageBytes))
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				erofstest.CheckFileBytes(t, src, "a", data)
+				var copied testBuffer
+				var opts []erofs.CreateOpt
+				var extra *os.File
+				if output != "image" {
+					extra, err = os.CreateTemp(t.TempDir(), "inline-data")
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer extra.Close()
+					opts = append(opts, erofs.WithDataFile(extra))
+					if output == "compressed-datafile" {
+						opts = append(opts, erofs.WithCompression())
+					}
+				}
+				w := erofs.Create(&copied, opts...)
+				if err := w.CopyFrom(src, erofs.MetadataOnly()); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.CopyEntries(erofs.SourceEntries{RemovePaths: []string{"/a"}}); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+				var openOpts []erofs.OpenOpt
+				if extra != nil {
+					openOpts = append(openOpts, erofs.WithExtraDevices(extra))
+				}
+				result, err := erofs.Open(bytes.NewReader(copied.Bytes()), openOpts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				erofstest.CheckFileBytes(t, result, "b", data)
+				erofstest.CheckFileBytes(t, result, "c", data)
+				b, c := erofstest.Stat(t, result, "b"), erofstest.Stat(t, result, "c")
+				if b.Ino != c.Ino || b.Nlink != 2 {
+					t.Fatalf("surviving inline hardlinks: b=%+v c=%+v", b, c)
+				}
+			})
+		}
+	}
+}
+
 func TestCopyFromImageLargeInlineDirectory(t *testing.T) {
 	var source testBuffer
 	base := erofs.Create(&source)

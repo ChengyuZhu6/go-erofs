@@ -30,10 +30,3 @@ func entryFromSys(info fs.FileInfo) *builder.Entry {
 		return nil
 	}
 }
-
-func erofsHardlinkKey(info fs.FileInfo, stat *Stat) string {
-	if info.Mode().IsRegular() && stat.Nlink > 1 {
-		return fmt.Sprintf("erofs:%d", stat.Ino)
-	}
-	return ""
-}
