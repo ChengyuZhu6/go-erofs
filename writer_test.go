@@ -3,8 +3,11 @@ package erofs
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/erofs/go-erofs/internal/builder"
@@ -164,5 +167,170 @@ func TestChunkBitsFromChunks(t *testing.T) {
 				t.Fatalf("chunkBitsFromChunks = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFileReadAt(t *testing.T) {
+	first := bytes.Repeat([]byte{0x31}, 4096)
+	second := bytes.Repeat([]byte{0x72}, 4096)
+	for _, size := range []int{0, 37, 4096, 8193, 4*4096 + 512} {
+		want := make([]byte, size)
+		for i := range want {
+			want[i] = byte(i*17 + i/4096)
+		}
+		for _, external := range []bool{false, true} {
+			meta, err := os.CreateTemp(t.TempDir(), "meta-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = meta.Close() }()
+			entry := SourceEntry{Path: "/file", Mode: 0o444, Size: int64(size), Data: bytes.NewReader(want)}
+			source := SourceEntries{BlockSize: 4096, Entries: []SourceEntry{entry}}
+			var options []CopyOpt
+			if external {
+				entry.Data = nil
+				want = make([]byte, size)
+				for at := 0; at < size; at += 4096 {
+					n := min(4096, size-at)
+					r := DataRange{Offset: -1, Size: int64(n)}
+					if at/4096%3 != 1 {
+						r.Device, r.Offset = uint16(at/4096%2), 0
+						payload := first
+						if r.Device == 1 {
+							payload = second
+						}
+						copy(want[at:at+n], payload[:n])
+					}
+					entry.DataRanges = append(entry.DataRanges, r)
+				}
+				source.Entries[0] = entry
+				source.ExternalDeviceBlocks = []uint64{1, 1}
+				options = []CopyOpt{MetadataOnly()}
+			}
+			writer := Create(meta, WithBlockSize(4096))
+			if err := writer.CopyEntries(source, options...); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var readOptions []OpenOpt
+			if external {
+				readOptions = []OpenOpt{WithExtraDevices(bytes.NewReader(first), bytes.NewReader(second))}
+			}
+			image, err := Open(meta, readOptions...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opened, err := image.Open("file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := opened.(*file)
+			stat, err := meta.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.ValidateData([]int64{stat.Size(), 4096, 4096}); err != nil {
+				t.Fatalf("size=%d external=%t validation: %v", size, external, err)
+			}
+			if external && size > 0 && f.ValidateData([]int64{stat.Size(), 0, 0}) == nil {
+				t.Fatal("device byte limit ignored")
+			}
+			var wg sync.WaitGroup
+			for _, at := range []int64{0, 31, 4090, int64(size), int64(size + 1)} {
+				at := at
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for range 20 {
+						p := bytes.Repeat([]byte{0xff}, 128)
+						n, err := f.ReadAt(p, at)
+						expected := min(len(p), max(0, size-int(at)))
+						if n != expected || (expected < len(p) && !errors.Is(err, io.EOF)) || (expected == len(p) && err != nil) {
+							t.Errorf("size=%d external=%t at=%d n=%d err=%v", size, external, at, n, err)
+						} else if expected > 0 && !bytes.Equal(p[:n], want[at:at+int64(n)]) {
+							t.Errorf("size=%d external=%t read data differs at %d layout=%d", size, external, at, f.info.inodeLayout)
+						}
+						if _, err := f.Stat(); err != nil {
+							t.Error(err)
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			if n, err := f.ReadAt(nil, int64(size+1)); n != 0 || err != nil {
+				t.Fatalf("empty read: %d %v", n, err)
+			}
+			if _, err := f.ReadAt(nil, -1); !errors.Is(err, fs.ErrInvalid) {
+				t.Fatalf("negative offset: %v", err)
+			}
+			p := make([]byte, size)
+			if _, err := io.ReadFull(f, p); err != nil || !bytes.Equal(p, want) {
+				t.Fatalf("ReadAt changed cursor: %v", err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.ReadAt(make([]byte, 1), 0); !errors.Is(err, fs.ErrClosed) {
+				t.Fatalf("read after close: %v", err)
+			}
+		}
+	}
+}
+
+func TestFileReadAtMappedDeviceBoundary(t *testing.T) {
+	meta := bytes.Repeat([]byte{0x31}, 4*4096)
+	extra := bytes.Repeat([]byte{0x72}, 4096)
+	for _, layout := range []uint8{disk.LayoutFlatPlain, disk.LayoutFlatInline} {
+		f := &file{img: &image{
+			sb: disk.SuperBlock{BlkSizeBits: 12}, meta: bytes.NewReader(meta),
+			devices: []deviceInfo{{device: bytes.NewReader(extra), mappedBlkAddr: 2, blocks: 1}},
+		}, info: &inode{mode: 0o444, size: 2*4096 + 37, inodeData: 1, icsize: 32, inodeLayout: layout}}
+		if err := f.ValidateData([]int64{int64(len(meta)), 4096}); err != nil {
+			t.Fatal(err)
+		}
+		if f.ValidateData([]int64{int64(len(meta)), 0}) == nil {
+			t.Fatal("mapped device length was not checked")
+		}
+		whole := make([]byte, f.info.size)
+		if n, err := f.ReadAt(whole, 0); n != len(whole) || err != nil {
+			t.Fatalf("whole read: n=%d err=%v", n, err)
+		}
+		for off := 0; off < len(whole); off += 4096 {
+			part := make([]byte, min(4096, len(whole)-off))
+			if _, err := f.ReadAt(part, int64(off)); err != nil || !bytes.Equal(part, whole[off:off+len(part)]) {
+				t.Fatalf("request size changes mapped data at %d: %v", off, err)
+			}
+		}
+		if !bytes.Equal(whole[4096:8192], extra) || !bytes.Equal(whole[:4096], meta[:4096]) {
+			t.Fatal("mapped device contents differ")
+		}
+	}
+}
+
+func TestFileReadAtRejectsInvalidMapping(t *testing.T) {
+	for _, format := range []uint16{0, disk.LayoutChunkFormatIndexes, disk.LayoutChunkFormat48Bit, 0x8000} {
+		for _, truncated := range []bool{false, true} {
+			index := make([]byte, 64)
+			entry := index[32:40]
+			if format&disk.LayoutChunkFormatIndexes != 0 {
+				binary.LittleEndian.PutUint32(entry[4:], 1)
+			} else {
+				binary.LittleEndian.PutUint32(entry, 1)
+			}
+			if truncated {
+				index = index[:33]
+			}
+			f := &file{img: &image{sb: disk.SuperBlock{BlkSizeBits: 12}, meta: bytes.NewReader(index)}, info: &inode{mode: 0o444, size: 4096, icsize: 32, inodeLayout: disk.LayoutChunkBased, inodeData: uint32(format)}}
+			err := f.ValidateData([]int64{8192})
+			if truncated || format == disk.LayoutChunkFormat48Bit || format == 0x8000 {
+				if err == nil {
+					t.Fatalf("invalid mapping accepted: format=%x truncated=%t", format, truncated)
+				}
+			} else if err != nil {
+				t.Fatalf("valid chunk format=%x rejected: %v", format, err)
+			}
+		}
 	}
 }

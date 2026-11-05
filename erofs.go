@@ -34,8 +34,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"path"
 	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -891,11 +893,10 @@ func (i *image) Open(name string) (fs.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := file{img: i, name: basename, nid: nid, ftype: ftype}
 	if ftype.IsDir() {
-		return &dir{file: b}, nil
+		return &dir{file: file{img: i, name: basename, nid: nid, ftype: ftype}}, nil
 	}
-	return &b, nil
+	return &file{img: i, name: basename, nid: nid, ftype: ftype}, nil
 }
 
 func (i *image) Stat(name string) (fs.FileInfo, error) {
@@ -983,9 +984,15 @@ type file struct {
 	nid   uint64
 	ftype fs.FileMode
 
-	// Mutable fields, open file should not be accessed concurrently
-	offset int64  // current offset for read operations
-	info   *inode // cached inode
+	mu     sync.RWMutex
+	closed bool
+	offset int64
+	info   *inode
+
+	readAtOnce   sync.Once
+	readAtRanges []DataRange
+	readAtStarts []int64
+	readAtErr    error
 }
 
 func (b *file) readInfo() (ino *inode, err error) {
@@ -1131,7 +1138,8 @@ func (b *file) statInfo() (*fileInfo, error) {
 			img := b.img
 			fi.rangesLoader = func() []DataRange {
 				f := &file{img: img}
-				return f.buildChunkDataRanges(&inoCopy)
+				ranges, _ := f.buildChunkDataRanges(&inoCopy)
+				return ranges
 			}
 		} else {
 			fi.dataRanges = b.buildDataRanges(ino)
@@ -1171,7 +1179,8 @@ func (b *file) buildDataRanges(ino *inode) []DataRange {
 		ranges = append(ranges, DataRange{Device: 0, Offset: trailingAddr, Size: tailSize})
 		return ranges
 	case disk.LayoutChunkBased:
-		return b.buildChunkDataRanges(ino)
+		ranges, _ := b.buildChunkDataRanges(ino)
+		return ranges
 	}
 	return nil
 }
@@ -1193,32 +1202,33 @@ const maxChunkIndexBytes = 64 << 20 // 64 MiB
 //
 // The final entry (data or hole) has its Size trimmed to the file-tail length
 // so the invariant sum(Size) == ino.size holds precisely.
-func (b *file) buildChunkDataRanges(ino *inode) []DataRange {
+func (b *file) buildChunkDataRanges(ino *inode) ([]DataRange, error) {
 	chunkFmt := uint16(ino.inodeData)
-	if chunkFmt&disk.LayoutChunkFormatIndexes == 0 {
-		return nil
-	}
-	// 48-bit chunk addressing is not yet implemented; the null-chunk sentinel
-	// (blkLo == 0xFFFFFFFF) is only unambiguous in 32-bit address mode.
 	if chunkFmt&disk.LayoutChunkFormat48Bit != 0 {
-		return nil
+		return nil, ErrNotImplemented
+	}
+	if chunkFmt&^(disk.LayoutChunkFormatBits|disk.LayoutChunkFormatIndexes) != 0 {
+		return nil, ErrInvalid
 	}
 	chunkBits := b.img.sb.BlkSizeBits + uint8(chunkFmt&disk.LayoutChunkFormatBits)
-	nchunks := int((ino.size-1)>>chunkBits) + 1
+	nchunks := (ino.size-1)>>chunkBits + 1
 	chunkSize := int64(1) << chunkBits
-
+	unit := int64(4)
+	if chunkFmt&disk.LayoutChunkFormatIndexes != 0 {
+		unit = disk.SizeChunkIndex
+	}
 	inodeStart := b.img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact
 	baseOffset := inodeStart + ino.flatDataOffset()
-	if baseOffset%8 != 0 {
-		baseOffset = (baseOffset + 7) & ^int64(7)
+	baseOffset = (baseOffset + unit - 1) & ^(unit - 1)
+	if nchunks > maxChunkIndexBytes/unit {
+		return nil, fmt.Errorf("chunk index exceeds %d bytes: %w", maxChunkIndexBytes, ErrInvalid)
 	}
-	needed := int64(nchunks) * int64(disk.SizeChunkIndex)
-	if needed > maxChunkIndexBytes {
-		return nil
-	}
+	needed := nchunks * unit
 	idxBuf := make([]byte, needed)
-	if _, err := b.img.meta.ReadAt(idxBuf, baseOffset); err != nil {
-		return nil
+	if n, err := b.img.meta.ReadAt(idxBuf, baseOffset); err != nil {
+		return nil, err
+	} else if int64(n) != needed {
+		return nil, io.ErrUnexpectedEOF
 	}
 
 	var ranges []DataRange
@@ -1229,10 +1239,10 @@ func (b *file) buildChunkDataRanges(ino *inode) []DataRange {
 			size = ino.size - int64(i)*chunkSize
 		}
 
-		off := i * disk.SizeChunkIndex
-		blkLo := binary.LittleEndian.Uint32(idxBuf[off+4 : off+8])
+		off := i * unit
+		entry := idxBuf[off : off+unit]
+		blkLo := binary.LittleEndian.Uint32(entry[unit-4:])
 		if ^blkLo == 0 {
-			// Null/hole chunk: coalesce with a preceding hole if possible.
 			if len(ranges) > 0 && ranges[len(ranges)-1].Offset == holeOffset {
 				ranges[len(ranges)-1].Size += size
 			} else {
@@ -1240,11 +1250,14 @@ func (b *file) buildChunkDataRanges(ino *inode) []DataRange {
 			}
 			continue
 		}
-
-		blkHi := binary.LittleEndian.Uint16(idxBuf[off : off+2])
-		deviceID := binary.LittleEndian.Uint16(idxBuf[off+2:off+4]) & b.img.deviceIDMask
-		phys := (uint64(blkHi) << 32) | uint64(blkLo)
-		byteOffset := int64(phys) << b.img.sb.BlkSizeBits
+		var deviceID uint16
+		if unit == disk.SizeChunkIndex {
+			if binary.LittleEndian.Uint16(entry[:2]) != 0 {
+				return nil, ErrNotImplemented
+			}
+			deviceID = binary.LittleEndian.Uint16(entry[2:4]) & b.img.deviceIDMask
+		}
+		byteOffset := int64(blkLo) << b.img.sb.BlkSizeBits
 
 		// Merge with the previous entry if it is a data range that is
 		// physically contiguous on the same device.
@@ -1257,14 +1270,186 @@ func (b *file) buildChunkDataRanges(ino *inode) []DataRange {
 		}
 		ranges = append(ranges, DataRange{Device: deviceID, Offset: byteOffset, Size: size})
 	}
-	return ranges
+	return ranges, nil
+}
+
+func (b *file) prepareReadAt() error {
+	b.readAtOnce.Do(func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.closed {
+			b.readAtErr = fs.ErrClosed
+			return
+		}
+		ino, err := b.readInfo()
+		if err != nil {
+			b.readAtErr = err
+			return
+		}
+		if !ino.mode.IsRegular() {
+			b.readAtErr = ErrInvalid
+			return
+		}
+		if ino.inodeLayout == disk.LayoutCompressedFull || ino.inodeLayout == disk.LayoutCompressedCompact {
+			b.readAtErr = ErrNotImplemented
+			return
+		}
+		if ino.size < 0 {
+			b.readAtErr = ErrInvalid
+			return
+		}
+		var ranges []DataRange
+		if ino.size > 0 {
+			if ino.inodeLayout == disk.LayoutChunkBased {
+				ranges, err = b.buildChunkDataRanges(ino)
+			} else {
+				ranges = b.buildDataRanges(ino)
+			}
+		}
+		if err != nil {
+			b.readAtErr = err
+			return
+		}
+		if ino.inodeLayout == disk.LayoutFlatInline && ino.size > 0 {
+			blockSize := int64(1) << b.img.sb.BlkSizeBits
+			addr := b.img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact + ino.flatDataOffset()
+			if addr%blockSize+(ino.size-1)%blockSize+1 > blockSize {
+				b.readAtErr = fmt.Errorf("inline data crosses block boundary: %w", ErrInvalid)
+				return
+			}
+		}
+		var size int64
+		for i, r := range ranges {
+			if r.Size <= 0 || r.Size > ino.size-size || r.Offset < holeOffset || r.Offset > math.MaxInt64-r.Size || (r.Offset >= 0 && int(r.Device) > len(b.img.devices)) {
+				b.readAtErr = fmt.Errorf("invalid file data range %d: %w", i, ErrInvalid)
+				return
+			}
+			size += r.Size
+			if r.Device != 0 || r.Offset == holeOffset {
+				b.readAtRanges = append(b.readAtRanges, r)
+				continue
+			}
+			for r.Size > 0 {
+				part := r
+				for i, dev := range b.img.devices {
+					if dev.mappedBlkAddr == 0 {
+						continue
+					}
+					start := int64(dev.mappedBlkAddr) << b.img.sb.BlkSizeBits
+					end := start + int64(dev.blocks)<<b.img.sb.BlkSizeBits
+					if r.Offset >= start && r.Offset < end {
+						part.Device = uint16(i + 1)
+						part.Offset -= start
+						part.Size = min(part.Size, end-r.Offset)
+						break
+					}
+					if r.Offset < start {
+						part.Size = min(part.Size, start-r.Offset)
+					}
+				}
+				b.readAtRanges = append(b.readAtRanges, part)
+				r.Offset += part.Size
+				r.Size -= part.Size
+			}
+		}
+		if size != ino.size {
+			b.readAtErr = fmt.Errorf("file data range coverage %d differs from size %d: %w", size, ino.size, ErrInvalid)
+			return
+		}
+		b.readAtStarts = make([]int64, len(b.readAtRanges))
+		var at int64
+		for i, r := range b.readAtRanges {
+			b.readAtStarts[i] = at
+			at += r.Size
+		}
+	})
+	return b.readAtErr
+}
+
+// ValidateData checks uncompressed mappings against caller-known device byte
+// lengths, including metadata at index zero, without reading file payloads.
+func (b *file) ValidateData(deviceSizes []int64) error {
+	if err := b.prepareReadAt(); err != nil {
+		return err
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return fs.ErrClosed
+	}
+	for _, r := range b.readAtRanges {
+		if r.Offset == holeOffset {
+			continue
+		}
+		if int(r.Device) >= len(deviceSizes) || r.Offset > deviceSizes[r.Device] || r.Size > deviceSizes[r.Device]-r.Offset {
+			return fmt.Errorf("file data range exceeds device %d: %w", r.Device, ErrInvalid)
+		}
+	}
+	return nil
+}
+
+// ReadAt supports concurrent random reads without changing the Read cursor.
+// The image's underlying devices must also support concurrent ReadAt calls.
+func (b *file) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, ErrInvalid
+	}
+	if err := b.prepareReadAt(); err != nil {
+		return 0, err
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return 0, fs.ErrClosed
+	}
+	var total int
+	for len(p) > 0 {
+		if off >= b.info.size {
+			return total, io.EOF
+		}
+		i := sort.Search(len(b.readAtRanges), func(i int) bool {
+			return b.readAtStarts[i]+b.readAtRanges[i].Size > off
+		})
+		r := b.readAtRanges[i]
+		within := off - b.readAtStarts[i]
+		part := p[:min(int64(len(p)), r.Size-within)]
+		if r.Offset == holeOffset {
+			clear(part)
+		} else {
+			device, at, err := b.img.mapDev(r.Device, r.Offset+within)
+			if err != nil {
+				return total, err
+			}
+			n, err := device.ReadAt(part, at)
+			if n != len(part) || err != nil {
+				if err == nil {
+					err = io.ErrUnexpectedEOF
+				}
+				return total + n, err
+			}
+		}
+		total += len(part)
+		off += int64(len(part))
+		p = p[len(part):]
+	}
+	return total, nil
 }
 
 func (b *file) Stat() (fs.FileInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil, fs.ErrClosed
+	}
 	return b.statInfo()
 }
 
 func (b *file) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, fs.ErrClosed
+	}
 	fi, err := b.readInfo()
 	if err != nil {
 		return 0, err
@@ -1298,6 +1483,9 @@ func (b *file) Read(p []byte) (int, error) {
 }
 
 func (b *file) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
 	if b.info != nil && b.info.cached != nil {
 		b.img.putBlock(b.info.cached)
 		b.info.cached = nil
@@ -1416,13 +1604,12 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 			}
 
 			if i >= d.consumed && name != "." && name != ".." {
-				f := file{
+				ents = append(ents, &direntry{file: file{
 					img:   d.img,
 					name:  name,
 					nid:   dirents[0].Nid,
 					ftype: disk.EroFSFtypeToFileMode(dirents[0].FileType),
-				}
-				ents = append(ents, &direntry{f})
+				}})
 				d.consumed = i + 1
 
 				if n > 0 && len(ents) == n {
