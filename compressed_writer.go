@@ -250,7 +250,7 @@ func (w *Writer) compressTree(root *erofsEntry) (*os.File, error) {
 
 func (w *erofsWriter) writeCompressedIndexes(out io.Writer, e *erofsEntry) error {
 	count := (int64(e.size)-1)/int64(w.blockSize) + 1
-	if count > (maxChunkIndexBytes-16)/8 {
+	if count > ((64<<20)-16)/8 {
 		return ErrInvalid
 	}
 	indexes := make([]byte, 16+count*8)

@@ -2,13 +2,98 @@ package erofs_test
 
 import (
 	"bytes"
+	"encoding/binary"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	erofs "github.com/erofs/go-erofs"
+	"github.com/erofs/go-erofs/internal/disk"
 )
+
+func TestChunkIndex64GiB(t *testing.T) {
+	const size = int64(64) << 30
+	const block = int64(4096)
+	const position = size - 2*block
+	device := bytes.Repeat([]byte{0x71}, int(block))
+	meta, err := os.Create(filepath.Join(t.TempDir(), "meta.erofs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = meta.Close() }()
+	writer := erofs.Create(meta)
+	if err := writer.CopyEntries(erofs.SourceEntries{
+		BlockSize: 4096, ExternalDeviceBlocks: []uint64{1},
+		Entries: []erofs.SourceEntry{{Path: "/disk.raw", Mode: 0o444, Size: size,
+			DataRanges: []erofs.DataRange{{Offset: -1, Size: position},
+				{Device: 1, Offset: 0, Size: block, Existing: true}, {Offset: -1, Size: block}}}},
+	}, erofs.MetadataOnly()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := meta.Stat()
+	if err != nil || info.Size() < 128<<20 || info.Size() > (128<<20)+65536 {
+		t.Fatalf("4KiB index metadata=%v err=%v", info, err)
+	}
+	image, err := erofs.Open(meta, erofs.WithExtraDevices(bytes.NewReader(device)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := image.Open("disk.raw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	validated := file.(interface {
+		io.ReaderAt
+		ValidateData([]int64) error
+	})
+	if err := validated.ValidateData([]int64{info.Size(), block}); err != nil {
+		t.Fatal(err)
+	}
+	stat, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []erofs.DataRange{{Offset: -1, Size: position},
+		{Device: 1, Offset: 0, Size: block}, {Offset: -1, Size: block}}
+	if got := stat.(interface{ DataRange() []erofs.DataRange }).DataRange(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("64GiB ranges=%+v", got)
+	}
+	data := make([]byte, 3*block)
+	if _, err := validated.ReadAt(data, position-block); err != nil {
+		t.Fatal(err)
+	}
+	expected := append(make([]byte, block), device...)
+	expected = append(expected, make([]byte, block)...)
+	if !bytes.Equal(data, expected) {
+		t.Fatal("4KiB data or adjacent holes changed")
+	}
+	// Keep actual bytes present while declaring a shorter primary image.
+	var declared [4]byte
+	binary.LittleEndian.PutUint32(declared[:], 2)
+	if _, err := meta.WriteAt(declared[:], disk.SuperBlockOffset+36); err != nil {
+		t.Fatal(err)
+	}
+	corrupt, err := erofs.Open(meta, erofs.WithExtraDevices(bytes.NewReader(device)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, err := corrupt.Open("disk.raw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = bad.Close() }()
+	if err := bad.(interface{ ValidateData([]int64) error }).ValidateData([]int64{info.Size(), block}); err == nil {
+		t.Fatal("chunk index beyond declared primary image accepted")
+	}
+	t.Logf("CHUNK_INDEX_64GIB_PASS logical=%d metadata=%d ranges=%d", size, info.Size(), len(want))
+}
 
 // TestChunkBasedXattrAlignment guards against the chunk-index map being written
 // unaligned after the xattr area on a chunk-based (external-device) inode.

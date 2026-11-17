@@ -431,7 +431,8 @@ func (img *image) openDirect(ino *inode) io.Reader {
 			baseOffset = (baseOffset + 7) & ^int64(7)
 		}
 		needed := int64(nchunks) * int64(disk.SizeChunkIndex)
-		if needed > maxChunkIndexBytes {
+		primaryBytes := int64(img.sb.Blocks) << img.sb.BlkSizeBits
+		if needed > maxChunkIndexBytes || baseOffset < 0 || baseOffset > primaryBytes || needed > primaryBytes-baseOffset {
 			return nil
 		}
 		idxBuf := make([]byte, needed)
@@ -1234,9 +1235,8 @@ func (b *file) buildDataRanges(ino *inode) []DataRange {
 }
 
 // maxChunkIndexBytes is an upper bound on the chunk-index table we will
-// allocate for a single file. 64 MiB covers ~8 M chunks; no real EROFS image
-// should approach this, and it prevents allocation bombs from corrupt images.
-const maxChunkIndexBytes = 64 << 20 // 64 MiB
+// allocate for a single file. A 64GiB disk with 4KiB chunks needs 128MiB.
+const maxChunkIndexBytes = 128 << 20
 
 // buildChunkDataRanges parses chunk indexes into DataRange entries covering
 // the complete logical layout of the file. The returned slice satisfies the
@@ -1272,6 +1272,10 @@ func (b *file) buildChunkDataRanges(ino *inode) ([]DataRange, error) {
 		return nil, fmt.Errorf("chunk index exceeds %d bytes: %w", maxChunkIndexBytes, ErrInvalid)
 	}
 	needed := nchunks * unit
+	primaryBytes := int64(b.img.sb.Blocks) << b.img.sb.BlkSizeBits
+	if baseOffset < 0 || baseOffset > primaryBytes || needed > primaryBytes-baseOffset {
+		return nil, fmt.Errorf("chunk index exceeds primary image: %w", ErrInvalid)
+	}
 	idxBuf := make([]byte, needed)
 	if n, err := b.img.meta.ReadAt(idxBuf, baseOffset); err != nil {
 		return nil, err

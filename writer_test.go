@@ -381,7 +381,7 @@ func TestFileReadAtRejectsInvalidMapping(t *testing.T) {
 			if truncated {
 				index = index[:33]
 			}
-			f := &file{img: &image{sb: disk.SuperBlock{BlkSizeBits: 12}, meta: bytes.NewReader(index)}, info: &inode{mode: 0o444, size: 4096, icsize: 32, inodeLayout: disk.LayoutChunkBased, inodeData: uint32(format)}}
+			f := &file{img: &image{sb: disk.SuperBlock{BlkSizeBits: 12, Blocks: 2}, meta: bytes.NewReader(index)}, info: &inode{mode: 0o444, size: 4096, icsize: 32, inodeLayout: disk.LayoutChunkBased, inodeData: uint32(format)}}
 			err := f.ValidateData([]int64{8192})
 			if truncated || format == disk.LayoutChunkFormat48Bit || format == 0x8000 {
 				if err == nil {
