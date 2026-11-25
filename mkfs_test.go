@@ -2756,3 +2756,43 @@ func statDataRange(t *testing.T, fsys fs.FS, name string) []erofs.DataRange {
 	}
 	return dr.DataRange()
 }
+
+// TestCompactInodeEndsImage covers images whose last 32 bytes are a compact
+// inode. readInfo previously read 64 bytes (the extended inode size) past the
+// end of the image, returning io.EOF even though the compact inode was fully
+// present.
+func TestCompactInodeEndsImage(t *testing.T) {
+	for n := 70; n < 100; n++ {
+		buf := &testBuffer{}
+		w := erofs.Create(buf, erofs.WithBuildTime(0, 0))
+		for i := range n {
+			f, err := w.Create(fmt.Sprintf("/f%03d", i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("n=%d: Open: %v", n, err)
+		}
+		if err := fs.WalkDir(efs, ".", func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			_, err = d.Info()
+			return err
+		}); err != nil {
+			t.Errorf("n=%d: WalkDir: %v", n, err)
+		}
+		cw := erofs.Create(&testBuffer{})
+		if err := cw.CopyFrom(efs); err != nil {
+			t.Errorf("n=%d: CopyFrom: %v", n, err)
+		}
+	}
+}
